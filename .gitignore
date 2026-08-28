@@ -1,7 +1,8 @@
-# Build output
+# Build output. Anchored with a leading slash: bare `modelforge` would also
+# match the cmd/modelforge source directory and silently exclude it.
 /bin/
-modelforge
-modelforgectl
+/modelforge
+/modelforgectl
 
 # Test and coverage artifacts
 coverage.out

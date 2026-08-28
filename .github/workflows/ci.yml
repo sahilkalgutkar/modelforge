@@ -55,8 +55,20 @@ jobs:
       - name: Build
         run: CGO_ENABLED=0 go build ./...
 
+      # -p 1 runs one package at a time. Several suites drive the whole stack
+      # against the same Postgres and truncate it between cases, so running
+      # packages concurrently has them resetting the database underneath each
+      # other. The alternative — a database per package — buys parallelism this
+      # suite does not need at its current size.
+      #
+      # -coverpkg attributes coverage to the package that owns the code rather
+      # than the package running the test. Without it the end-to-end suites,
+      # which exercise serving and routing through HTTP, would report those
+      # packages as untested.
       - name: Test
-        run: go test -race -coverprofile=coverage.out -covermode=atomic ./... 2>&1 | tee test-output.txt
+        run: |
+          go test -p 1 -race -coverpkg=./internal/... \
+            -coverprofile=coverage.out -covermode=atomic ./... 2>&1 | tee test-output.txt
 
       # A green job is not proof the tests ran. The registry suite fails rather
       # than skips when Postgres is unreachable, but a `t.Skip` added later

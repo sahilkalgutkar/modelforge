@@ -45,7 +45,7 @@ func testStore(t *testing.T) *Store {
 
 	// Each test gets an empty registry. The cascade from models clears
 	// versions and deployments with it.
-	if _, err := s.pool.Exec(ctx, `TRUNCATE models CASCADE`); err != nil {
+	if err := s.Reset(ctx); err != nil {
 		t.Fatalf("reset database: %v", err)
 	}
 	return s
