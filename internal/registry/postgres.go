@@ -335,3 +335,18 @@ func hasPGCode(err error, code string) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == code
 }
+
+// Reset removes every model, and with it every version and policy through the
+// foreign-key cascades.
+//
+// It exists for tests, which need an empty registry per case and would
+// otherwise collide on model names across runs. It is exported because the
+// tests that need it live in other packages — the API suite drives the whole
+// stack — and Go has no way to export a symbol to tests alone. It is not part
+// of the served API surface: nothing in cmd/ or internal/api calls it.
+func (s *Store) Reset(ctx context.Context) error {
+	if _, err := s.pool.Exec(ctx, `TRUNCATE models CASCADE`); err != nil {
+		return fmt.Errorf("registry: reset: %w", err)
+	}
+	return nil
+}

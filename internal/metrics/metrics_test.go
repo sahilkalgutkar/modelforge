@@ -1,0 +1,87 @@
+package metrics
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/prometheus/common/expfmt"
+
+	"github.com/sahilkalgutkar/modelforge/internal/drift"
+	"github.com/sahilkalgutkar/modelforge/internal/routing"
+)
+
+func TestCollectorsRecord(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := New(reg)
+
+	m.ObservePrediction("fraud", 2, 3*time.Millisecond)
+	m.ObservePrediction("fraud", 2, 4*time.Millisecond)
+	m.ObserveError("fraud", "overloaded")
+	m.ObserveBatch("fraud", 2, 16)
+
+	if got := testutil.ToFloat64(m.predictions.WithLabelValues("fraud", "2")); got != 2 {
+		t.Errorf("predictions = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.errors.WithLabelValues("fraud", "overloaded")); got != 1 {
+		t.Errorf("errors = %v, want 1", got)
+	}
+}
+
+// TestLatencyBucketsResolveSubMillisecond guards the reason for the custom
+// buckets: the default Prometheus buckets start at 5ms, which would put every
+// prediction in the first bucket and make the histogram useless for the
+// batching window it exists to show.
+func TestLatencyBucketsResolveSubMillisecond(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := New(reg)
+
+	m.ObservePrediction("m", 1, 300*time.Microsecond)
+	m.ObservePrediction("m", 1, 30*time.Millisecond)
+
+	out, err := testutil.CollectAndFormat(reg, expfmt.TypeTextPlain, "modelforge_prediction_duration_seconds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(out)
+	if !strings.Contains(text, `le="0.0005"`) {
+		t.Errorf("no sub-millisecond bucket in the histogram:\n%s", text)
+	}
+}
+
+func TestShadowOutcomes(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := New(reg)
+
+	m.ObserveShadow(routing.ShadowOutcome{Model: "m", MaxDelta: 0.001})
+	m.ObserveShadow(routing.ShadowOutcome{Model: "m", Diverged: true, MaxDelta: 0.4})
+	m.ObserveShadow(routing.ShadowOutcome{Model: "m", Err: errors.New("boom")})
+
+	for outcome, want := range map[string]float64{"agreed": 1, "diverged": 1, "failed": 1} {
+		if got := testutil.ToFloat64(m.shadowComparisons.WithLabelValues("m", outcome)); got != want {
+			t.Errorf("%s = %v, want %v", outcome, got, want)
+		}
+	}
+}
+
+func TestDriftGauges(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := New(reg)
+
+	pred := drift.Reading{Feature: "prediction", PSI: 0.42}
+	m.ObserveDrift(drift.Report{
+		Model: "fraud", Version: 3,
+		Features:   []drift.Reading{{Feature: "amount", PSI: 0.31}},
+		Prediction: &pred,
+	})
+
+	if got := testutil.ToFloat64(m.driftPSI.WithLabelValues("fraud", "3", "amount")); got != 0.31 {
+		t.Errorf("amount PSI gauge = %v, want 0.31", got)
+	}
+	if got := testutil.ToFloat64(m.driftPSI.WithLabelValues("fraud", "3", "prediction")); got != 0.42 {
+		t.Errorf("prediction PSI gauge = %v, want 0.42", got)
+	}
+}
