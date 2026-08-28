@@ -1,0 +1,105 @@
+{
+  "title": "modelforge",
+  "uid": "modelforge",
+  "editable": true,
+  "time": { "from": "now-30m", "to": "now" },
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Traffic by version",
+      "description": "During a canary this is the split actually being served, which is the first thing to check when a rollout does not look like the policy says it should.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum by (model, version) (rate(modelforge_predictions_total[1m]))",
+          "legendFormat": "{{model}} v{{version}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "p99 latency by version",
+      "description": "Compared per version rather than per model on purpose: a canary that is slower than the incumbent is invisible in an aggregate that is still 90% incumbent traffic.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, model, version) (rate(modelforge_prediction_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{model}} v{{version}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Mean batch size",
+      "description": "A value near 1 means requests are arriving too slowly to group, so the batching window is adding latency and buying nothing.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum by (model, version) (rate(modelforge_batch_size_sum[5m])) / sum by (model, version) (rate(modelforge_batch_size_count[5m]))",
+          "legendFormat": "{{model}} v{{version}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Errors by reason",
+      "description": "Split by reason because 'overloaded' and 'unknown_feature' call for opposite responses: one is capacity, the other is a caller sending the wrong thing.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum by (model, reason) (rate(modelforge_errors_total[1m]))",
+          "legendFormat": "{{model}} {{reason}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Shadow comparisons",
+      "description": "How often the candidate agrees with what is being served. A rising 'diverged' rate is the signal to look at the candidate before promoting it.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum by (model, outcome) (rate(modelforge_shadow_comparisons_total[5m]))",
+          "legendFormat": "{{model}} {{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Feature drift (PSI)",
+      "description": "Population Stability Index per feature over the serving window. The thresholds drawn here are the conventional readings: 0.1 moderate, 0.25 significant.",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "modelforge_feature_psi",
+          "legendFormat": "{{model}} v{{version}} {{feature}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.1 },
+              { "color": "red", "value": 0.25 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        }
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}
