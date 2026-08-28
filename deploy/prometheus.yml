@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: modelforge
+    static_configs:
+      # host.docker.internal reaches a server run with `make run` on the host.
+      # Running the server in the compose file instead would mean rebuilding
+      # the image on every code change, which is the wrong trade for the loop
+      # this stack is meant to support.
+      - targets: ["host.docker.internal:8080"]

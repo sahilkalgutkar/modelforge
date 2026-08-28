@@ -1,0 +1,44 @@
+groups:
+  - name: modelforge
+    rules:
+      # Drift is a slow signal by construction — PSI is computed over a
+      # 15-minute window — so it is given a long `for` rather than firing on
+      # the first scrape that crosses the line.
+      - alert: FeatureDriftSignificant
+        expr: modelforge_feature_psi > 0.25
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.feature }} on {{ $labels.model }}:{{ $labels.version }} has drifted"
+          description: "PSI {{ $value | printf \"%.2f\" }} is past the 0.25 significance threshold; the model's calibration should not be trusted until this is understood."
+
+      # A canary disagreeing with the incumbent is the thing a shadow exists to
+      # surface, and it should be seen before the candidate takes traffic.
+      - alert: ShadowDivergenceHigh
+        expr: |
+          sum by (model) (rate(modelforge_shadow_comparisons_total{outcome="diverged"}[5m]))
+          / sum by (model) (rate(modelforge_shadow_comparisons_total[5m])) > 0.1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.model }} shadow disagrees with the served version on >10% of requests"
+
+      - alert: PredictionErrorsElevated
+        expr: |
+          sum by (model) (rate(modelforge_errors_total[5m]))
+          / sum by (model) (rate(modelforge_predictions_total[5m]) + rate(modelforge_errors_total[5m])) > 0.05
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.model }} is failing more than 5% of requests"
+
+      # A batch mean near 1 means requests are arriving too slowly to group, so
+      # the batching window is pure added latency and should be lowered.
+      - alert: BatchingIneffective
+        expr: |
+          sum by (model) (rate(modelforge_batch_size_sum[10m]))
+          / sum by (model) (rate(modelforge_batch_size_count[10m])) < 1.5
+        for: 30m
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $labels.model }} is barely batching; the window may be adding latency for nothing"
