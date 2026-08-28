@@ -1,0 +1,20 @@
+# Build output
+/bin/
+modelforge
+modelforgectl
+
+# Test and coverage artifacts
+coverage.out
+coverage.html
+
+# Local artifact store, created by the server at runtime
+/var/
+/data/
+
+# Python virtualenv for the fixture generator
+.venv/
+__pycache__/
+
+# macOS / iCloud
+.DS_Store
+* 2.*

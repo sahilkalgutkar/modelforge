@@ -1,0 +1,25 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 80%
+        threshold: 1%
+    patch:
+      default:
+        target: 80%
+        threshold: 1%
+
+ignore:
+  # main() binds a listener, wires dependencies together and blocks on a
+  # signal. The logic worth testing was pulled out into internal/server, which
+  # is covered; what is left here is process wiring with no branching to assert
+  # on, so covering it would mean starting a process rather than testing code.
+  - "cmd/modelforge/main.go"
+  - "cmd/modelforgectl/main.go"
+  # Generated or vendored data, not source.
+  - "testdata/**"
+  - "tools/**"
+
+comment:
+  layout: "reach,diff,flags,files"
+  behavior: default
