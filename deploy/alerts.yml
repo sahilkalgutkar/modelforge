@@ -32,6 +32,18 @@ groups:
         annotations:
           summary: "{{ $labels.model }} is failing more than 5% of requests"
 
+      # Distinct clients being throttled is the shape of a credential-stuffing
+      # attempt or, far more often, a deploy that shipped with the wrong token.
+      # Either is worth a look; neither is worth waking somebody, so this is a
+      # warning rather than a page.
+      - alert: AuthenticationFailuresThrottled
+        expr: increase(modelforge_auth_throttled_total[15m]) > 3
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} clients throttled for repeated authentication failures"
+          description: "Check the logs for the addresses; a single one is usually a misconfigured client, several is worth investigating."
+
       # A batch mean near 1 means requests are arriving too slowly to group, so
       # the batching window is pure added latency and should be lowered.
       - alert: BatchingIneffective

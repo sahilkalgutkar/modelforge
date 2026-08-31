@@ -20,14 +20,30 @@ func FromContext(ctx context.Context) (Token, bool) {
 type Middleware struct {
 	auth *Authenticator
 	log  *slog.Logger
+
+	// limiter is optional; nil means failed authentication is not throttled.
+	limiter *Limiter
+	// trustForwardedFor selects which address identifies a client. See
+	// clientKey for why neither choice is safe to default.
+	trustForwardedFor bool
 }
 
-// NewMiddleware builds a Middleware.
+// NewMiddleware builds a Middleware with no rate limiting.
 func NewMiddleware(a *Authenticator, log *slog.Logger) *Middleware {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Middleware{auth: a, log: log}
+}
+
+// WithLimiter returns a Middleware that throttles clients failing
+// authentication. It is a separate constructor rather than a field on the first
+// so that adding a limiter is a visible change at the call site.
+func WithLimiter(a *Authenticator, log *slog.Logger, l *Limiter, trustForwardedFor bool) *Middleware {
+	m := NewMiddleware(a, log)
+	m.limiter = l
+	m.trustForwardedFor = trustForwardedFor
+	return m
 }
 
 // Require wraps a handler so that only tokens carrying scope reach it, and puts
@@ -42,8 +58,41 @@ func NewMiddleware(a *Authenticator, log *slog.Logger) *Middleware {
 // permissions problem when the real one is an unset environment variable.
 func (m *Middleware) Require(scope Scope, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var key string
+		if m.limiter != nil {
+			key = clientKey(r, m.trustForwardedFor)
+		}
+
+		// Authentication happens before the rate-limit check, so a valid
+		// credential is never refused for throttling. Checking the limit first
+		// would be marginally cheaper — it skips a SHA-256 over a short string,
+		// which is noise next to the HTTP stack already traversed to get here —
+		// but it would refuse a legitimate caller whose address is shared with
+		// somebody failing. Behind a NAT or a shared egress that is a real
+		// outage for an innocent client, bought with a saving too small to
+		// measure. The threat being controlled is the cost of *failures*, and
+		// nothing about that requires punishing a request that turned out to be
+		// correct.
 		tok, err := m.auth.Authenticate(r)
+
 		if err != nil {
+			if m.limiter != nil {
+				if ok, wait := m.limiter.Allow(key); !ok {
+					w.Header().Set("Retry-After", retryAfter(wait))
+					// Logging is suppressed while a client is throttled.
+					// Log volume is the main thing this defends, so writing a
+					// line per throttled request would be self-defeating.
+					if shouldLog, suppressed := m.limiter.ShouldLog(key); shouldLog {
+						m.log.Warn("throttling a client that keeps failing authentication",
+							"remote", key, "retry_after", wait.String(), "suppressed", suppressed)
+					}
+					writeErr(w, http.StatusTooManyRequests,
+						"too many failed authentication attempts; retry after "+retryAfter(wait)+"s")
+					return
+				}
+				m.limiter.RecordFailure(key)
+			}
+
 			// WWW-Authenticate is what tells a client this is an
 			// authentication challenge rather than a generic refusal, and RFC
 			// 7235 requires it on a 401.
@@ -55,7 +104,18 @@ func (m *Middleware) Require(scope Scope, next http.Handler) http.Handler {
 			return
 		}
 
+		if m.limiter != nil {
+			// The credential was good, so whatever this client got wrong
+			// before is behind it.
+			m.limiter.RecordSuccess(key)
+		}
+
 		if !tok.Allows(scope) {
+			// Deliberately not recorded as a rate-limit failure. This is a
+			// valid credential refused for lacking a scope — a misconfigured
+			// client, not somebody guessing — and throttling it would take a
+			// deploy script offline for holding the wrong role.
+			//
 			// Logged at Warn with the token name: a credential repeatedly
 			// reaching for a scope it does not have is either a misconfigured
 			// deploy or somebody probing, and both are worth seeing.

@@ -44,6 +44,21 @@ type Config struct {
 	// explicitly: an unset Tokens list is a configuration mistake, not a
 	// request to serve the control plane to anyone who can reach the port.
 	AuthDisabled bool
+
+	// AuthMaxFailures is how many authentication failures one client may make
+	// before it is throttled. Zero uses the default; negative disables
+	// throttling.
+	AuthMaxFailures int
+
+	// AuthFailureWindow is how long an exhausted failure budget takes to
+	// refill.
+	AuthFailureWindow time.Duration
+
+	// TrustForwardedFor makes the rate limiter key on X-Forwarded-For rather
+	// than the socket address. Set it only when a proxy in front of this
+	// server overwrites that header, because it is otherwise trivially
+	// spoofable and the limit becomes evadable.
+	TrustForwardedFor bool
 }
 
 // App is a running server's dependencies.
@@ -106,6 +121,8 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	apiSrv := api.NewServer(api.Deps{
 		Registry: reg, Manager: manager, Router: router,
 		Logger: cfg.Logger, Metrics: met, Auth: authn,
+		Limiter:           buildLimiter(cfg, met),
+		TrustForwardedFor: cfg.TrustForwardedFor,
 	})
 
 	mux := http.NewServeMux()
@@ -115,6 +132,22 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	a.handler = mux
 	a.auth = authn
 	return a, nil
+}
+
+// buildLimiter builds the failed-authentication rate limiter, or nil.
+//
+// Throttling is off when authentication is off: with no credential to get
+// wrong there are no failures to count, and a limiter would only be machinery
+// that never fires.
+func buildLimiter(cfg Config, met *metrics.Metrics) *auth.Limiter {
+	if cfg.AuthDisabled || cfg.AuthMaxFailures < 0 {
+		return nil
+	}
+	return auth.NewLimiter(auth.LimiterConfig{
+		MaxFailures: cfg.AuthMaxFailures,
+		Window:      cfg.AuthFailureWindow,
+		OnLimit:     func(string) { met.ObserveAuthThrottled() },
+	})
 }
 
 // buildAuth turns the configuration into an Authenticator, failing closed.

@@ -85,3 +85,27 @@ func TestDriftGauges(t *testing.T) {
 		t.Errorf("prediction PSI gauge = %v, want 0.42", got)
 	}
 }
+
+func TestAuthThrottledCounter(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := New(reg)
+
+	m.ObserveAuthThrottled()
+	m.ObserveAuthThrottled()
+
+	if got := testutil.ToFloat64(m.authThrottled); got != 2 {
+		t.Errorf("auth throttled counter = %v, want 2", got)
+	}
+
+	// The client address must not be a label. It is attacker-controlled and
+	// unbounded, so using it would let anybody mint arbitrary time series and
+	// take the monitoring down — a worse outcome than the failed logins it
+	// describes.
+	out, err := testutil.CollectAndFormat(reg, expfmt.TypeTextPlain, "modelforge_auth_throttled_total")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "{") {
+		t.Errorf("the throttle counter carries labels, risking cardinality explosion:\n%s", out)
+	}
+}

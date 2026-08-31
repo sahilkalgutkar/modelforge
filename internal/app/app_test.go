@@ -603,3 +603,118 @@ func TestMetricsRequiresACredentialEndToEnd(t *testing.T) {
 		t.Errorf("/metrics without a credential = %d, want 401", resp.StatusCode)
 	}
 }
+
+// TestFailedAuthIsThrottledEndToEnd drives the limiter through a fully wired
+// app, so it covers the flag plumbing as well as the middleware.
+func TestFailedAuthIsThrottledEndToEnd(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.AuthMaxFailures = 3
+	cfg.AuthFailureWindow = time.Minute
+
+	a, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	bad := func() *http.Response {
+		req, _ := http.NewRequest("GET", ts.URL+"/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer wrong-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	for i := range 3 {
+		resp := bad()
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("attempt %d = %d, want 401 while budget remains", i, resp.StatusCode)
+		}
+	}
+
+	resp := bad()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("after the budget = %d, want 429", resp.StatusCode)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Error("429 without a Retry-After header")
+	}
+
+	// The correct credential from the same address still works, which is the
+	// property that keeps a shared egress from becoming an outage.
+	ok, err := getAuthed(t, ts.URL+"/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("a valid credential from a throttled address = %d, want 200", ok.StatusCode)
+	}
+}
+
+// TestThrottlingCanBeTurnedOff covers the escape hatch for deployments that do
+// volumetric defence upstream and do not want a second, weaker one here.
+func TestThrottlingCanBeTurnedOff(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.AuthMaxFailures = -1
+
+	a, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	for i := range 30 {
+		req, _ := http.NewRequest("GET", ts.URL+"/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer wrong-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("attempt %d = %d, want 401 with throttling disabled", i, resp.StatusCode)
+		}
+	}
+}
+
+// TestThrottlingIsAbsentWhenAuthIsDisabled: with no credential to get wrong,
+// there are no failures to count.
+func TestThrottlingIsAbsentWhenAuthIsDisabled(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.Tokens = nil
+	cfg.AuthDisabled = true
+
+	a, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	for range 50 {
+		resp, err := http.Get(ts.URL + "/v1/models")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("= %d with auth disabled, want 200", resp.StatusCode)
+		}
+	}
+}
