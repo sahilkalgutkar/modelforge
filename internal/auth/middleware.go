@@ -31,6 +31,15 @@ type Middleware struct {
 	// of credential it was. It exists so the server can count service versus
 	// user logins without this package depending on Prometheus.
 	OnAuthenticated func(kind string)
+
+	// sessions, when set, lets a browser authenticate with a cookie.
+	sessions *SessionStore
+}
+
+// WithSessions lets browser cookies authenticate alongside bearer tokens.
+func (m *Middleware) WithSessions(s *SessionStore) *Middleware {
+	m.sessions = s
+	return m
 }
 
 // NewMiddleware builds a Middleware with no rate limiting.
@@ -78,7 +87,28 @@ func (m *Middleware) Require(scope Scope, next http.Handler) http.Handler {
 		// measure. The threat being controlled is the cost of *failures*, and
 		// nothing about that requires punishing a request that turned out to be
 		// correct.
+		// A bearer token wins over a cookie. A client that sent one is making a
+		// deliberate statement about which identity it wants, and silently
+		// preferring an ambient session cookie would let a browser-borne
+		// session override the credential an API call explicitly presented.
 		tok, err := m.auth.Authenticate(r)
+
+		var sess *Session
+		if errors.Is(err, ErrNoCredential) && m.sessions != nil {
+			if cookie, cerr := r.Cookie(SessionCookie); cerr == nil {
+				if found, serr := m.sessions.Get(cookie.Value); serr == nil {
+					// The CSRF check happens before the session is accepted, so
+					// a cross-site request never reaches a handler at all.
+					if cerr := CheckCSRF(r, found); cerr != nil {
+						m.log.Warn("rejected a session request that failed the CSRF check",
+							"actor", found.Token.Name, "method", r.Method, "path", r.URL.Path)
+						writeErr(w, http.StatusForbidden, cerr.Error())
+						return
+					}
+					sess, tok, err = found, found.Token, nil
+				}
+			}
+		}
 
 		// A credential that verified but grants nothing is a 403, not a 401.
 		// The holder proved who they are — their signature checked out and
@@ -134,6 +164,9 @@ func (m *Middleware) Require(scope Scope, next http.Handler) http.Handler {
 			kind := "service"
 			if tok.Human() {
 				kind = "user"
+			}
+			if sess != nil {
+				kind = "session"
 			}
 			m.OnAuthenticated(kind)
 		}

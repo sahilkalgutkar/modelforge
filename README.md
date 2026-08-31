@@ -519,6 +519,82 @@ A provider with no revocation endpoint is reported plainly rather than glossed,
 because "logged out" quietly meaning two different things depending on the
 provider is how somebody ends up believing a credential is dead when it is not.
 
+### Browser sessions
+
+A browser can sign in and stay signed in:
+
+```
+GET /login          → the identity provider → back with a session cookie
+GET /logout         → the session is destroyed server-side
+```
+
+The cookie carries **an opaque random id and nothing else**. Putting a signed
+identity in it instead would mean a session cannot be revoked before it expires,
+because the server has nothing to delete — and revocation is most of what makes
+sessions safe to hand out.
+
+**Every cookie attribute closes a specific hole**, and there is a test asserting
+each one:
+
+| Attribute | What it stops |
+| --- | --- |
+| `HttpOnly` | script reading the session — an XSS bug elsewhere cannot steal it |
+| `Secure` | the session travelling over plaintext HTTP |
+| `SameSite=Lax` | cross-site form posts carrying the cookie |
+| no `Domain` | one compromised subdomain reading the session |
+
+The CSRF cookie is the deliberate exception to `HttpOnly`: the double-submit
+pattern depends on same-origin script being able to read it.
+
+**Reads need only the cookie; writes need a CSRF token.** `SameSite=Lax` already
+stops a cross-site page sending the cookie on a POST, and the token is the second
+lock on the same door — worth having because SameSite is a *browser* behaviour,
+and an old browser or a proxy that strips the attribute defeats it, while a token
+the attacker cannot read is not defeated by any of that. The comparison is
+constant-time, because unlike the token digests elsewhere here there is no hash
+in front of it to scramble a near miss.
+
+Verified against a running server:
+
+```
+POST /v1/models  (cookie, no token)   → 403  auth: CSRF check failed
+POST /v1/models  (cookie + token)     → 201
+```
+
+**A session is never a weaker front door.** The ID token is verified through the
+same path an API request takes, so a cookie cannot carry an identity a bearer
+token could not — a user in no mapped group gets 403 and no session at all. Two
+verification routines would be two places for the rules to drift, and the weaker
+one becomes the way in.
+
+**A bearer token beats a cookie** when both are present. A client that sent a
+credential meant it, and an ambient session silently overriding it is how a
+script ends up running as whoever last used the browser.
+
+**Session ids are minted only after authentication**, which is what makes session
+fixation impossible: there is no way to hand somebody an id beforehand and have
+it become their session. The session also never outlives the token behind it, so
+access withdrawn at the provider is not extended by a cookie.
+
+**The redirect target is validated, not trusted.** An open redirect on a login
+endpoint is worth more than most: the victim authenticates for real at their real
+provider and is then bounced somewhere the attacker controls, which is what a
+convincing phish looks like. `//evil.example` is rejected explicitly — it is
+protocol-relative, so a browser reads it as another origin while a naive
+"starts with `/`" check reads it as a local path. That one character is the
+whole bug.
+
+The PKCE verifier, state and nonce are held **server-side**, keyed by a
+short-lived cookie. They could be put in a signed cookie, but there is no reason
+to hand a browser the secret that proves the token exchange belongs to this
+login.
+
+Enable with `-external-url`, which must be configured rather than derived from
+the request — `Host` is caller-controlled, and building the OAuth redirect URI
+from it would let somebody point the provider's callback wherever they liked.
+`-insecure-cookies` drops `Secure` for local HTTP and logs a warning saying
+exactly what that costs.
+
 ### A bug worth recording
 
 The first version left `Endpoint.AuthStyle` unset. `x/oauth2` then probes for
@@ -671,7 +747,7 @@ and a fake agrees with whatever the code happens to do.
 same database and truncate it between cases, so running packages concurrently
 has them resetting the database underneath each other.
 
-Coverage is **90.4%** of `internal/`, measured with `-coverpkg` so that code is
+Coverage is **89.7%** of `internal/`, measured with `-coverpkg` so that code is
 attributed to the package that owns it rather than the package running the test
 — without it the end-to-end suites, which exercise serving and routing through
 HTTP, would report those packages as untested.
@@ -706,6 +782,9 @@ fail silently:
 | `TestRotatedRefreshTokenIsStored` | a session that works until the old token is retired |
 | `TestConcurrentRefreshDoesNotBreakTheSession` | two parallel commands invalidating each other's token |
 | `TestLogoutRevokesAtTheProvider` | "logged out" leaving a working credential alive |
+| `TestCrossSiteWriteIsRefused` | another origin acting with your session cookie |
+| `TestLoginRejectsAnOpenRedirect` | a real sign-in bouncing to an attacker's page |
+| `TestBearerTokenBeatsCookie` | an ambient session overriding an explicit credential |
 
 ## Known limitations
 
@@ -725,11 +804,12 @@ I would rather write these down than let someone discover them.
 - **The rollout guard reacts to errors, not to quality.** It catches a version
   that is throwing, not one that is quietly predicting badly — that needs
   labels, which arrive long after the request.
-- **The login flow is for a terminal, not a browser session.** `modelforgectl
-  login` gets a person a credential; the server itself has no cookies and no
-  sign-in page, so a browser pointed straight at the API gets a 401 rather than
-  a redirect. Adding sessions would mean cookie handling and CSRF defence for
-  the sake of an API with no UI in front of it.
+- **Browser sessions live in memory, so a restart signs everybody out.** That is
+  the deliberate trade: the alternative writes credential-equivalent material
+  into a database that is backed up, replicated and read by people debugging
+  models. Losing a session costs one click.
+- **There is still no UI.** Sessions let a browser reach the API and `/metrics`;
+  they do not put a dashboard in front of them.
 - **A stolen credential file is worth more than it used to be.** It now holds a
   refresh token, which outlives the ID token it renews. Rotation, 0600
   permissions and revocation on logout are the mitigations; none of them make it
