@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/sahilkalgutkar/modelforge/internal/auth"
+	"github.com/sahilkalgutkar/modelforge/internal/drift"
 	"github.com/sahilkalgutkar/modelforge/internal/routing"
 )
 
@@ -328,4 +329,127 @@ func truncate(s string) string {
 		return s[:600] + "..."
 	}
 	return s
+}
+
+// TestDashboardRendersRealDriftReadings covers the path where a version has
+// enough traffic to report, which is the one that actually shows numbers.
+func TestDashboardRendersRealDriftReadings(t *testing.T) {
+	h := newHarness(t)
+	h.do("POST", "/v1/models", createModelRequest{Name: "drifting"}) //nolint:errcheck
+	v := h.upload("drifting", "binary_logistic.model.json", featureNames(6))
+	h.do("PUT", "/v1/models/drifting/policy", routing.Policy{ //nolint:errcheck
+		Routes: []routing.Route{{Version: v, Weight: 1}},
+	})
+
+	// A baseline centred near zero.
+	samples := map[string][]float64{}
+	for _, f := range featureNames(6) {
+		vals := make([]float64, 1000)
+		for i := range vals {
+			vals[i] = float64(i%200)/100 - 1 // spread over [-1, 1)
+		}
+		samples[f] = vals
+	}
+	h.do("PUT", fmt.Sprintf("/v1/models/drifting/versions/%d/baseline", v), BaselineRequest{ //nolint:errcheck
+		Samples: samples, Bins: 10,
+	})
+
+	// Traffic well outside the baseline, enough to clear the sample threshold.
+	for i := range drift.MinSamples + 50 {
+		h.do("POST", "/v1/models/drifting/predict", PredictRequest{ //nolint:errcheck
+			Features: map[string]float64{
+				"f0": 9, "f1": 9, "f2": 9, "f3": 9, "f4": 9, "f5": 9,
+			},
+			Key: fmt.Sprintf("k%d", i),
+		})
+	}
+
+	_, body := h.getPage(t, "/models/drifting", "")
+	if strings.Contains(body, "Not enough traffic") {
+		t.Fatalf("drift still reports insufficient traffic:\n%s", truncate(body))
+	}
+	if !strings.Contains(body, "significant") {
+		t.Errorf("a large shift did not render as significant:\n%s", truncate(body))
+	}
+	// The severity class drives the colour, so it has to reach the markup.
+	if !strings.Contains(body, `class="bad"`) {
+		t.Errorf("no severity class rendered:\n%s", truncate(body))
+	}
+
+	// And the index rolls that up to the model.
+	_, index := h.getPage(t, "/", "")
+	if !strings.Contains(index, "significant") {
+		t.Errorf("the index does not surface the model's worst drift:\n%s", truncate(index))
+	}
+}
+
+func TestSeverityMapping(t *testing.T) {
+	for _, tc := range []struct {
+		sev   drift.Severity
+		class string
+		rank  int
+	}{
+		{drift.SeveritySignificant, "bad", 3},
+		{drift.SeverityModerate, "warn", 2},
+		{drift.SeverityStable, "ok", 1},
+	} {
+		if got := severityClass(tc.sev); got != tc.class {
+			t.Errorf("severityClass(%s) = %q, want %q", tc.sev, got, tc.class)
+		}
+		if got := severityRank(string(tc.sev)); got != tc.rank {
+			t.Errorf("severityRank(%s) = %d, want %d", tc.sev, got, tc.rank)
+		}
+	}
+	// Ranking has to order worst-first, since the index shows the worst.
+	if severityRank("significant") <= severityRank("moderate") {
+		t.Error("significant does not outrank moderate")
+	}
+	if severityRank("nonsense") != 0 {
+		t.Error("an unknown severity should rank below everything")
+	}
+	if got := severityClass("nonsense"); got != "ok" {
+		t.Errorf("severityClass of an unknown value = %q", got)
+	}
+}
+
+func TestScopeSummary(t *testing.T) {
+	if got := scopeSummary(auth.Token{Scopes: []auth.Scope{auth.ScopeRead, auth.ScopePredict}}); got != "read, predict" {
+		t.Errorf("scopeSummary = %q", got)
+	}
+	// An identity with nothing granted should say so rather than render blank.
+	if got := scopeSummary(auth.Token{}); got != "no scopes" {
+		t.Errorf("scopeSummary of an empty token = %q", got)
+	}
+}
+
+func TestVersionWeights(t *testing.T) {
+	weights, total := versionWeights(routing.Policy{
+		Routes: []routing.Route{{Version: 1, Weight: 90}, {Version: 2, Weight: 10}},
+	})
+	if total != 100 || weights[1] != 90 || weights[2] != 10 {
+		t.Errorf("versionWeights = %v, %d", weights, total)
+	}
+
+	// An undeployed model has no routes, and the caller divides by the total.
+	if _, total := versionWeights(routing.Policy{}); total != 0 {
+		t.Errorf("an empty policy totalled %d, want 0", total)
+	}
+}
+
+// TestSafeRedirect is the open-redirect guard the dashboard shares with the
+// login flow.
+func TestSafeRedirect(t *testing.T) {
+	for _, bad := range []string{
+		"", "https://evil.example", "//evil.example", "http://evil.example/x",
+		"javascript:alert(1)", "evil.example", "/",
+	} {
+		if got := safeRedirect(bad); got != "" {
+			t.Errorf("safeRedirect(%q) = %q, want empty", bad, got)
+		}
+	}
+	for _, good := range []string{"/models/x", "/v1/models?a=b", "/models/x#frag"} {
+		if got := safeRedirect(good); got == "" {
+			t.Errorf("safeRedirect(%q) rejected a same-site path", good)
+		}
+	}
 }
