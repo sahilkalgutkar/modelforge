@@ -45,6 +45,12 @@ func main() {
 		"claim carrying group membership")
 	scopeMap := flag.String("oidc-scope-map", os.Getenv("MODELFORGE_OIDC_SCOPE_MAP"),
 		"comma-separated group=scope[+scope] entries, e.g. platform-oncall=admin,ml-eng=read")
+	flag.StringVar(&cfg.ExternalURL, "external-url", os.Getenv("MODELFORGE_EXTERNAL_URL"),
+		"how a browser reaches this server, e.g. https://modelforge.example.com; enables browser sessions")
+	flag.DurationVar(&cfg.SessionTTL, "session-ttl", 12*time.Hour,
+		"how long a browser session lasts, capped by the identity token's own expiry")
+	flag.BoolVar(&cfg.InsecureCookies, "insecure-cookies", os.Getenv("MODELFORGE_INSECURE_COOKIES") == "true",
+		"drop the Secure attribute from session cookies; local HTTP development only")
 	flag.BoolVar(&cfg.TrustForwardedFor, "trust-forwarded-for", os.Getenv("MODELFORGE_TRUST_FORWARDED_FOR") == "true",
 		"rate-limit on X-Forwarded-For instead of the socket address; only safe behind a proxy that overwrites it")
 	flag.Parse()

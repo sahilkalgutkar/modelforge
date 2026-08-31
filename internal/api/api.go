@@ -40,6 +40,21 @@ type Deps struct {
 	Limiter *auth.Limiter
 	// TrustForwardedFor selects which address the limiter keys on.
 	TrustForwardedFor bool
+
+	// Sessions and Logins enable browser sessions. Both nil means the
+	// browser endpoints report themselves unavailable rather than half
+	// working.
+	Sessions *auth.SessionStore
+	Logins   *auth.LoginStore
+
+	// ExternalURL is how a browser reaches this server, used to build the
+	// OAuth redirect URI. It has to be configured rather than derived from the
+	// request: Host is caller-controlled, and building a redirect URI from it
+	// would let somebody point the provider's callback wherever they liked.
+	ExternalURL string
+
+	// InsecureCookies drops the Secure attribute, for local HTTP development.
+	InsecureCookies bool
 	// Metrics is optional; a nil Metrics means the handlers do not record.
 	Metrics Recorder
 }
@@ -104,6 +119,15 @@ func NewServer(deps Deps) *Server {
 	// nothing they do not already hold.
 	s.mux.Handle("GET /v1/auth/whoami", mw.RequireFunc(auth.ScopePredict, s.handleWhoAmI))
 
+	// Browser sessions. Unauthenticated by necessity — these are how somebody
+	// becomes authenticated in the first place.
+	if deps.Sessions != nil && deps.Logins != nil {
+		s.mux.HandleFunc("GET /login", s.handleBrowserLogin)
+		s.mux.HandleFunc("GET /auth/callback", s.handleBrowserCallback)
+		s.mux.HandleFunc("GET /logout", s.handleBrowserLogout)
+		s.mux.HandleFunc("POST /logout", s.handleBrowserLogout)
+	}
+
 	// Login metadata, deliberately unauthenticated: a client cannot present a
 	// credential before it knows where to obtain one, and every value here is
 	// visible to anybody who watches a browser perform a login.
@@ -134,6 +158,9 @@ func (s *Server) middleware() *auth.Middleware {
 	}
 	if r, ok := s.deps.Metrics.(AuthRecorder); ok && r != nil {
 		mw.OnAuthenticated = r.ObserveAuthentication
+	}
+	if s.deps.Sessions != nil {
+		mw = mw.WithSessions(s.deps.Sessions)
 	}
 	return mw
 }
@@ -623,6 +650,7 @@ func (s *Server) handleAuthConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := v.PublicConfig()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"login": true, "issuer": cfg.Issuer, "client_id": cfg.ClientID, "audience": cfg.Audience,
+		"browser_login": s.deps.Sessions != nil && s.deps.Logins != nil,
 	})
 }
 

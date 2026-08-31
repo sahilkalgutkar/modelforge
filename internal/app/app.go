@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -88,6 +89,23 @@ type Config struct {
 
 	// OIDCScopeMap maps group values to scopes, as `group=scope[+scope]`.
 	OIDCScopeMap []string
+
+	// ExternalURL is how a browser reaches this server. Setting it enables
+	// browser sessions, since the OAuth redirect URI must be a fixed,
+	// pre-registered absolute URL.
+	//
+	// It cannot be derived from the request: Host is caller-controlled, and
+	// building a redirect URI from it would let somebody point the provider's
+	// callback wherever they liked.
+	ExternalURL string
+
+	// SessionTTL caps how long a browser session lasts.
+	SessionTTL time.Duration
+
+	// InsecureCookies drops the Secure attribute from session cookies, for
+	// local HTTP development. Without Secure a session cookie travels over
+	// plain HTTP, where anybody on the path can read it.
+	InsecureCookies bool
 
 	// TrustForwardedFor makes the rate limiter key on X-Forwarded-For rather
 	// than the socket address. Set it only when a proxy in front of this
@@ -245,11 +263,31 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		return nil, err
 	}
 
+	var (
+		sessions *auth.SessionStore
+		logins   *auth.LoginStore
+	)
+	if cfg.ExternalURL != "" && cfg.OIDCIssuer != "" && cfg.OIDCClientID != "" {
+		sessions = auth.NewSessionStore(auth.SessionConfig{TTL: cfg.SessionTTL})
+		logins = auth.NewLoginStore(nil)
+		cfg.Logger.Info("browser sessions enabled",
+			"callback", strings.TrimRight(cfg.ExternalURL, "/")+"/auth/callback",
+			"secure_cookies", !cfg.InsecureCookies)
+		if cfg.InsecureCookies {
+			cfg.Logger.Warn("session cookies are being sent without the Secure attribute; " +
+				"they will travel over plain HTTP where anyone on the path can read them")
+		}
+	}
+
 	apiSrv := api.NewServer(api.Deps{
 		Registry: reg, Manager: manager, Router: router,
 		Logger: cfg.Logger, Metrics: met, Auth: authn,
 		Limiter:           buildLimiter(cfg, met),
 		TrustForwardedFor: cfg.TrustForwardedFor,
+		Sessions:          sessions,
+		Logins:            logins,
+		ExternalURL:       cfg.ExternalURL,
+		InsecureCookies:   cfg.InsecureCookies,
 	})
 
 	mux := http.NewServeMux()

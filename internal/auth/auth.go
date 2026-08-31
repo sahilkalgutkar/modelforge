@@ -16,6 +16,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -192,6 +193,20 @@ func Disabled() *Authenticator {
 	a := &Authenticator{disabled: true, now: time.Now}
 	a.set.Store(&tokenSet{byDigest: map[string]Token{}})
 	return a
+}
+
+// VerifyIDToken authenticates a raw ID token, applying the same scope mapping
+// an API request would get.
+//
+// The browser login uses this rather than its own path, so a cookie session can
+// never carry an identity a bearer token could not. Two verification routines
+// would be two places for the rules to drift apart, and the weaker one becomes
+// a second front door.
+func (a *Authenticator) VerifyIDToken(ctx context.Context, raw string) (Token, error) {
+	if a.oidc == nil {
+		return Token{}, ErrNoIdentityProvider
+	}
+	return a.oidc.Verify(ctx, raw)
 }
 
 // OIDC returns the identity provider verifier, or nil if none is configured.

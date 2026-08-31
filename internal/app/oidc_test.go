@@ -10,7 +10,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +26,11 @@ import (
 type fakeIDP struct {
 	server *httptest.Server
 	key    *rsa.PrivateKey
+
+	mu     sync.Mutex
+	codes  map[string]string // code -> nonce
+	groups []string
+	email  string
 }
 
 func newFakeIDP(t *testing.T) *fakeIDP {
@@ -33,7 +40,12 @@ func newFakeIDP(t *testing.T) *fakeIDP {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &fakeIDP{key: key}
+	p := &fakeIDP{
+		key:    key,
+		codes:  map[string]string{},
+		groups: []string{"platform-oncall"},
+		email:  "sahil@example.com",
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
@@ -41,8 +53,51 @@ func newFakeIDP(t *testing.T) *fakeIDP {
 		//nolint:errcheck // test server
 		json.NewEncoder(w).Encode(map[string]any{
 			"issuer":                                p.server.URL,
+			"authorization_endpoint":                p.server.URL + "/authorize",
+			"token_endpoint":                        p.server.URL + "/token",
 			"jwks_uri":                              p.server.URL + "/keys",
 			"id_token_signing_alg_values_supported": []string{"RS256"},
+		})
+	})
+
+	// The authorization endpoint. A real provider renders a login page here;
+	// this records the nonce and redirects straight back, which is what makes
+	// the browser flow drivable from a test client.
+	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		code := "code-" + q.Get("state")[:8]
+
+		p.mu.Lock()
+		p.codes[code] = q.Get("nonce")
+		p.mu.Unlock()
+
+		redirect, _ := url.Parse(q.Get("redirect_uri"))
+		rq := redirect.Query()
+		rq.Set("code", code)
+		rq.Set("state", q.Get("state"))
+		redirect.RawQuery = rq.Encode()
+		http.Redirect(w, r, redirect.String(), http.StatusFound)
+	})
+
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		//nolint:errcheck // test server
+		r.ParseForm()
+
+		p.mu.Lock()
+		nonce, known := p.codes[r.Form.Get("code")]
+		delete(p.codes, r.Form.Get("code")) // single use, as a real provider does
+		groups, email := p.groups, p.email
+		p.mu.Unlock()
+
+		if !known {
+			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		//nolint:errcheck // test server
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "opaque", "token_type": "Bearer", "expires_in": 3600,
+			"id_token": p.mintWithNonce(t, email, groups, nonce),
 		})
 	})
 	mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
@@ -60,6 +115,11 @@ func newFakeIDP(t *testing.T) *fakeIDP {
 
 func (p *fakeIDP) mint(t *testing.T, email string, groups []string) string {
 	t.Helper()
+	return p.mintWithNonce(t, email, groups, "")
+}
+
+func (p *fakeIDP) mintWithNonce(t *testing.T, email string, groups []string, nonce string) string {
+	t.Helper()
 
 	signer, err := jose.NewSigner(
 		jose.SigningKey{Algorithm: jose.RS256, Key: p.key},
@@ -69,11 +129,15 @@ func (p *fakeIDP) mint(t *testing.T, email string, groups []string) string {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	raw, err := jwt.Signed(signer).Claims(map[string]any{
+	claims := map[string]any{
 		"iss": p.server.URL, "aud": "modelforge", "sub": "sub-" + email,
 		"email": email, "groups": groups,
 		"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
-	}).Serialize()
+	}
+	if nonce != "" {
+		claims["nonce"] = nonce
+	}
+	raw, err := jwt.Signed(signer).Claims(claims).Serialize()
 	if err != nil {
 		t.Fatal(err)
 	}
