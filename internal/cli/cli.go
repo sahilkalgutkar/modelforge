@@ -8,6 +8,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,12 +39,22 @@ type Client struct {
 func NewClient(baseURL string, out io.Writer) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
-		Token:   os.Getenv("MODELFORGE_TOKEN"),
+		// The environment wins over a stored login, so a script can override
+		// whoever happens to be signed in on the machine it runs on.
+		Token: credential(),
 		// The timeout is generous because pushing a model uploads its
 		// artifact, which is the slowest thing this client does by far.
 		HTTP: &http.Client{Timeout: 2 * time.Minute},
 		Out:  out,
 	}
+}
+
+// credential resolves which token to send.
+func credential() string {
+	if t := os.Getenv("MODELFORGE_TOKEN"); t != "" {
+		return t
+	}
+	return LoadCredential()
 }
 
 // Usage is the help text.
@@ -67,12 +78,16 @@ Commands:
   drift <model> <version>                 show drift readings
   stats <model> <version>                 show batching and health counters
   token <name> <scope>[+<scope>] [--env]  mint an API token and print its config entry
+  login [--no-browser]                    sign in through your identity provider
+  logout                                  remove the stored login from this machine
+  whoami                                  show who the current credential belongs to
 
 Flags:
   -addr URL   server address (default http://localhost:8080, or MODELFORGE_ADDR)
 
 Environment:
-  MODELFORGE_TOKEN   bearer token sent with every request
+  MODELFORGE_TOKEN            bearer token sent with every request; overrides a stored login
+  MODELFORGE_CREDENTIAL_FILE  where the login command stores its result
 
 Scopes: predict (call the serving endpoint), read (inspect models, policies,
 drift and metrics), admin (everything, including changing what serves traffic).
@@ -152,6 +167,19 @@ func Run(args []string, addr string, out io.Writer) int {
 		if v, err = versionArg(args, "stats"); err == nil {
 			err = c.ShowStats(args[1], v)
 		}
+	case "login":
+		open := OpenBrowser
+		if len(args) > 1 && args[1] == "--no-browser" {
+			// For a headless machine, a remote shell, or anyone who would
+			// rather paste the URL into a browser they trust than have a
+			// process launch one for them.
+			open = func(string) error { return errNoBrowserRequested }
+		}
+		err = c.Login(context.Background(), open)
+	case "logout":
+		err = c.Logout()
+	case "whoami":
+		err = c.WhoAmI()
 	case "token":
 		if len(args) < 3 {
 			err = fmt.Errorf("token needs a name and at least one scope")

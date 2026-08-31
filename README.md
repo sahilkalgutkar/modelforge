@@ -405,6 +405,83 @@ services, and a token issued for the expense tool would otherwise be a valid
 credential here. The user is real, the token is real, and they never intended to
 authenticate against this.
 
+### Signing in
+
+```bash
+modelforgectl login
+# to sign in, visit:
+#
+#   https://idp.example.com/authorize?...
+#
+# opening your browser at https://idp.example.com...
+# signed in as sahil@example.com (admin)
+# this session expires at 2026-08-31T20:34:32Z
+
+modelforgectl whoami
+# sahil@example.com (user)
+#   scopes   admin
+#   subject  sub-sahil
+#   issuer   https://idp.example.com
+#   expires  2026-08-31T20:34:32Z
+```
+
+The credential is stored at `~/.config/modelforge/credential`, mode 0600 in a
+0700 directory — both set explicitly rather than left to the umask, since a
+umask of 022 leaves a readable credential in a home directory other accounts on
+the machine can list. An existing directory is tightened rather than trusted,
+because `MkdirAll` leaves the mode of one that already exists alone.
+`MODELFORGE_TOKEN` still wins if set, so a script can override whoever happens
+to be signed in on the machine it runs on.
+
+`--no-browser` prints the URL and waits, for a headless box, a remote shell, or
+anyone who would rather paste a URL into a browser they trust than have a
+process launch one.
+
+**This is the RFC 8252 native-application flow**, and its shape is dictated by
+what a command-line tool can safely do:
+
+- **No client secret.** One shipped inside a binary is a string every user can
+  read out of it. The client is public and **PKCE** takes the secret's place —
+  the test provider recomputes the challenge from the verifier and refuses a
+  mismatch, so the CLI cannot ship without it and still pass.
+- **`state` on every request**, checked before the code is touched. Without it
+  anybody who can make your browser load a URL can complete a login of their
+  choosing, and you end up holding *their* session.
+- **`nonce` bound to the login**, so a token captured from somewhere else cannot
+  be replayed into it.
+- **Redirect to `127.0.0.1`, not `localhost`.** `localhost` resolves through
+  DNS, and a hostile resolver points it elsewhere — at which point the
+  authorization code is delivered to somebody else's machine. The literal
+  address cannot be redirected. The port is ephemeral, which RFC 8252 requires
+  providers to accept for exactly this reason.
+- **The callback page interpolates nothing.** A provider's `error_description`
+  reflected into it would be cross-site scripting on a page that has just
+  handled an authorization code.
+
+The server advertises where to sign in at `GET /v1/auth/config`, which is
+deliberately unauthenticated: a client cannot present a credential before it
+knows where to obtain one, and every value there is visible to anybody watching
+a browser perform a login.
+
+`logout` deletes the local file and says plainly that this is **not**
+revocation — the token stays valid at the provider until it expires.
+
+### A bug worth recording
+
+The first version left `Endpoint.AuthStyle` unset. `x/oauth2` then probes for
+the server's preferred client-authentication style: it tries one, and if that
+is rejected, retries with the other.
+
+An authorization code is single-use. So the probe **burns the code**, and the
+error you see is the *second* attempt's `invalid_grant` — which points at the
+code, when the real problem was whatever made the first request fail. I spent a
+while chasing a phantom double-exchange because of it.
+
+Setting `AuthStyleInParams` explicitly is both correct — RFC 6749 says a public
+client sends its id in the body, having no secret for a Basic header — and
+removes the failure mode. Verified: one token request per login, where there
+had been two.
+
 ### Why a library for the JWT part
 
 I wrote the XGBoost scorer rather than binding to libxgboost, and did not write
@@ -541,7 +618,7 @@ and a fake agrees with whatever the code happens to do.
 same database and truncate it between cases, so running packages concurrently
 has them resetting the database underneath each other.
 
-Coverage is **91.7%** of `internal/`, measured with `-coverpkg` so that code is
+Coverage is **90.9%** of `internal/`, measured with `-coverpkg` so that code is
 attributed to the package that owns it rather than the package running the test
 — without it the end-to-end suites, which exercise serving and routing through
 HTTP, would report those packages as untested.
@@ -570,6 +647,9 @@ fail silently:
 | `TestUnsignedTokenIsRejected` | the `alg:none` bypass |
 | `TestWrongAudienceIsRejected` | a token minted for another service working here |
 | `TestAuthenticatedButNotAuthorised` | a valid login becoming access by default |
+| `TestPKCEIsActuallySent` | a login flow shipping without PKCE |
+| `TestCallbackRejectsAForgedState` | a forged callback completing somebody else's login |
+| `TestStoredCredentialIsPrivate` | a world-readable credential in a home directory |
 
 ## Known limitations
 
@@ -589,9 +669,14 @@ I would rather write these down than let someone discover them.
 - **The rollout guard reacts to errors, not to quality.** It catches a version
   that is throwing, not one that is quietly predicting badly — that needs
   labels, which arrive long after the request.
-- **There is no login flow.** The server verifies a JWT somebody already holds;
-  obtaining one is the identity provider's job. That is the right split, but it
-  means a browser hitting this API directly gets a 401 rather than a redirect.
+- **The login flow is for a terminal, not a browser session.** `modelforgectl
+  login` gets a person a credential; the server itself has no cookies and no
+  sign-in page, so a browser pointed straight at the API gets a 401 rather than
+  a redirect. Adding sessions would mean cookie handling and CSRF defence for
+  the sake of an API with no UI in front of it.
+- **There is no refresh.** When the token expires you log in again. Storing a
+  refresh token on disk is a longer-lived secret than the one it replaces, and
+  the sessions here are hours rather than minutes.
 - **Static-token revocation is as fast as the reload.** A withdrawn token stops
   working on the next `SIGHUP` or within the poll interval, not instantly across
   a fleet. OIDC logins do not have this problem — they expire on their own.

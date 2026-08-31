@@ -78,6 +78,11 @@ type Config struct {
 	// other service would authenticate here.
 	OIDCAudience string
 
+	// OIDCClientID is the public OAuth client the CLI logs in as. Without it
+	// tokens can still be verified, but nobody can obtain one through this
+	// server.
+	OIDCClientID string
+
 	// OIDCGroupsClaim names the claim carrying group membership.
 	OIDCGroupsClaim string
 
@@ -333,6 +338,7 @@ func buildAuth(ctx context.Context, cfg Config) (*auth.Authenticator, *auth.OIDC
 		verifier, err = auth.NewOIDCVerifier(ctx, auth.OIDCConfig{
 			Issuer:      cfg.OIDCIssuer,
 			Audience:    cfg.OIDCAudience,
+			ClientID:    cfg.OIDCClientID,
 			GroupsClaim: cfg.OIDCGroupsClaim,
 			ScopeMap:    scopeMap,
 		}, cfg.Logger)
