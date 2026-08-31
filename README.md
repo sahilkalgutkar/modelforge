@@ -352,6 +352,81 @@ token gets a distinct error from an unrecognised one, which leaks nothing the
 holder does not already know and is the difference between a minute of rotation
 and an hour hunting a phantom typo.
 
+### Per-user identity with OIDC
+
+Static tokens answer "which service is this". They cannot answer "which person
+changed the model that scores production traffic", because everybody with the
+credential looks identical. Pointing the server at an identity provider fixes
+that:
+
+```bash
+modelforge \
+  -oidc-issuer https://idp.example.com \
+  -oidc-audience modelforge \
+  -oidc-scope-map 'platform-oncall=admin,ml-eng=read,scorers=predict'
+```
+
+A user presents their ID token as the bearer credential. The signature is
+verified against the provider's published keys, the claims decide what they may
+do, and the audit log names them:
+
+```
+{"msg":"authorised change","actor":"sahil@example.com","method":"POST",
+ "path":"/v1/models","subject":"sub-sahil@example.com",
+ "issuer":"https://idp.example.com","kind":"user"}
+```
+
+Both the readable name and the stable `sub` are recorded. An email is what makes
+that line answerable without a directory lookup; a subject is what still joins
+correctly after somebody's surname changes.
+
+**Static tokens and user logins coexist.** A service scoring a thousand requests
+a second wants a credential it holds, not an interactive login. A person
+changing what serves traffic should be named rather than sharing a token with
+everyone else who has one. Both work at once, and the two are told apart by
+shape — a JWS has three dot-separated segments and a minted token has none — so
+a mistyped static token never has an RSA verification attempted against it.
+
+**Authenticated is not authorised.** A user in no mapped group is refused. The
+alternative is that every employee at the company gets whatever the fallback is,
+on the service that decides which model answers production traffic.
+
+That refusal is a **403, not a 401**, and getting this wrong is a genuinely
+confusing outage: the holder's signature checked out and their provider vouched
+for them, so telling them to re-authenticate sends a real employee round a loop
+against a provider that is working perfectly, when the fix is somebody adding
+them to a group. It does not spend rate-limit budget either — it is a permission
+problem, not somebody guessing. A *forged* token does spend budget, because that
+is somebody guessing.
+
+**The audience is mandatory and there is no "any audience" setting.** Skipping it
+is the classic confused-deputy bug: an identity provider mints tokens for many
+services, and a token issued for the expense tool would otherwise be a valid
+credential here. The user is real, the token is real, and they never intended to
+authenticate against this.
+
+### Why a library for the JWT part
+
+I wrote the XGBoost scorer rather than binding to libxgboost, and did not write
+the JWT verification. The difference is what a bug costs. A mistake in the
+scorer produces a wrong number, which a differential test against XGBoost
+catches. A mistake in JWT verification is a total authentication bypass —
+`alg:none`, RSA-versus-HMAC confusion, an unchecked `kid` — and the failure mode
+is that everything works perfectly while anybody can forge an admin identity.
+That is not a place to demonstrate that I can write code.
+
+So this uses `go-oidc`, and the tests verify it is wired up correctly rather
+than that RSA works: a real key, a real JWKS endpoint over HTTP, real signed
+tokens, and assertions that a token signed with the wrong key, a token with
+swapped claims, an `alg:none` token, an expired token and a token for the wrong
+audience are each refused. A stub returning "valid: true" would pass a
+feature-shaped test suite while leaving the server forgeable.
+
+**Provider outages degrade logins, they do not stop the server.** Discovery runs
+in the background with backoff. If the provider is unreachable at startup the
+process still boots, static credentials still work, the serving path still
+serves, and JWTs get a clean refusal until discovery succeeds.
+
 ### What is deliberately left open
 
 `/healthz` and `/readyz` need no credential. A liveness probe that needs one
@@ -466,7 +541,7 @@ and a fake agrees with whatever the code happens to do.
 same database and truncate it between cases, so running packages concurrently
 has them resetting the database underneath each other.
 
-Coverage is **91.9%** of `internal/`, measured with `-coverpkg` so that code is
+Coverage is **91.7%** of `internal/`, measured with `-coverpkg` so that code is
 attributed to the package that owns it rather than the package running the test
 — without it the end-to-end suites, which exercise serving and routing through
 HTTP, would report those packages as untested.
@@ -491,6 +566,10 @@ fail silently:
 | `TestSaturatedTableFailsOpen` | an attacker filling the limiter's table to lock others out |
 | `TestReloadIsAtomic` | a request mid-rotation seeing neither credential |
 | `TestABadRotationDoesNotTakeTheServerDown` | a malformed token file locking everyone out |
+| `TestForgedSignatureIsRejected` | a forged JWT authenticating as anybody |
+| `TestUnsignedTokenIsRejected` | the `alg:none` bypass |
+| `TestWrongAudienceIsRejected` | a token minted for another service working here |
+| `TestAuthenticatedButNotAuthorised` | a valid login becoming access by default |
 
 ## Known limitations
 
@@ -510,12 +589,15 @@ I would rather write these down than let someone discover them.
 - **The rollout guard reacts to errors, not to quality.** It catches a version
   that is throwing, not one that is quietly predicting badly — that needs
   labels, which arrive long after the request.
-- **Tokens are long-lived credentials, not sessions.** They rotate without a
-  restart and can carry an expiry, but there is no issuer, no refresh and no
-  per-user identity. Short-lived credentials would want OIDC and a JWKS
-  endpoint, which is a different design.
-- **Revocation is as fast as the reload.** A withdrawn token stops working on
-  the next `SIGHUP`, or within the poll interval — not instantly across a fleet.
+- **There is no login flow.** The server verifies a JWT somebody already holds;
+  obtaining one is the identity provider's job. That is the right split, but it
+  means a browser hitting this API directly gets a 401 rather than a redirect.
+- **Static-token revocation is as fast as the reload.** A withdrawn token stops
+  working on the next `SIGHUP` or within the poll interval, not instantly across
+  a fleet. OIDC logins do not have this problem — they expire on their own.
+- **Group membership is read from the token, not the directory.** If somebody
+  leaves a group, their access changes when their token is next reissued, not
+  the moment the directory does.
 - **Rate limiting keys on the client address, which is a shared resource.**
   Behind a NAT everyone shares a bucket, so a burst of 10 is per egress rather
   than per person. A valid credential is never refused, which is what keeps that

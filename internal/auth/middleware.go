@@ -26,6 +26,11 @@ type Middleware struct {
 	// trustForwardedFor selects which address identifies a client. See
 	// clientKey for why neither choice is safe to default.
 	trustForwardedFor bool
+
+	// OnAuthenticated is called after a credential is accepted, with the kind
+	// of credential it was. It exists so the server can count service versus
+	// user logins without this package depending on Prometheus.
+	OnAuthenticated func(kind string)
 }
 
 // NewMiddleware builds a Middleware with no rate limiting.
@@ -75,6 +80,22 @@ func (m *Middleware) Require(scope Scope, next http.Handler) http.Handler {
 		// correct.
 		tok, err := m.auth.Authenticate(r)
 
+		// A credential that verified but grants nothing is a 403, not a 401.
+		// The holder proved who they are — their signature checked out and
+		// their provider vouched for them — they are simply in no group this
+		// server grants access to. Reporting that as 401 would send a real
+		// employee to re-authenticate over and over against a provider that is
+		// working perfectly, when the actual fix is somebody adding them to a
+		// group. It is the same distinction as a scope failure, and for the
+		// same reason it does not spend rate-limit budget: this is a
+		// misconfigured permission, not somebody guessing.
+		if err != nil && errors.Is(err, ErrForbidden) {
+			m.log.Warn("rejected an authenticated identity with no granted scopes",
+				"method", r.Method, "path", r.URL.Path, "error", err)
+			writeErr(w, http.StatusForbidden, err.Error())
+			return
+		}
+
 		if err != nil {
 			if m.limiter != nil {
 				if ok, wait := m.limiter.Allow(key); !ok {
@@ -109,6 +130,13 @@ func (m *Middleware) Require(scope Scope, next http.Handler) http.Handler {
 			// before is behind it.
 			m.limiter.RecordSuccess(key)
 		}
+		if m.OnAuthenticated != nil {
+			kind := "service"
+			if tok.Human() {
+				kind = "user"
+			}
+			m.OnAuthenticated(kind)
+		}
 
 		if !tok.Allows(scope) {
 			// Deliberately not recorded as a rate-limit failure. This is a
@@ -139,8 +167,18 @@ func (m *Middleware) Require(scope Scope, next http.Handler) http.Handler {
 		// real money to store. The scope is the honest test: admin is exactly
 		// the set of routes that alter what serves traffic.
 		if isMutation(r.Method) && scope == ScopeAdmin && !m.auth.IsDisabled() {
-			m.log.Info("authorised change",
-				"token", tok.Name, "method", r.Method, "path", r.URL.Path)
+			attrs := []any{"actor", tok.Name, "method", r.Method, "path", r.URL.Path}
+			if tok.Human() {
+				// The subject and issuer are recorded alongside the readable
+				// name because the name can change — somebody's surname, an
+				// email alias — and the subject cannot. A log that only kept
+				// the readable form stops joining to a directory the moment
+				// anybody gets married.
+				attrs = append(attrs, "subject", tok.Subject, "issuer", tok.Issuer, "kind", "user")
+			} else {
+				attrs = append(attrs, "kind", "service")
+			}
+			m.log.Info("authorised change", attrs...)
 		}
 
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), contextKey{}, tok)))

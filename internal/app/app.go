@@ -69,6 +69,21 @@ type Config struct {
 	// refill.
 	AuthFailureWindow time.Duration
 
+	// OIDCIssuer, when set, enables per-user authentication against an
+	// identity provider alongside the static tokens.
+	OIDCIssuer string
+
+	// OIDCAudience is the value a token's `aud` claim must contain. Required
+	// when OIDCIssuer is set: without it, a token the provider minted for any
+	// other service would authenticate here.
+	OIDCAudience string
+
+	// OIDCGroupsClaim names the claim carrying group membership.
+	OIDCGroupsClaim string
+
+	// OIDCScopeMap maps group values to scopes, as `group=scope[+scope]`.
+	OIDCScopeMap []string
+
 	// TrustForwardedFor makes the rate limiter key on X-Forwarded-For rather
 	// than the socket address. Set it only when a proxy in front of this
 	// server overwrites that header, because it is otherwise trivially
@@ -86,6 +101,17 @@ type App struct {
 	metrics  *metrics.Metrics
 	handler  http.Handler
 	auth     *auth.Authenticator
+	oidc     *auth.OIDCVerifier
+}
+
+// WaitForIdentityProvider blocks until OIDC discovery completes, or returns
+// immediately when no provider is configured. It exists for tests and for a
+// deployment that would rather fail fast than serve with logins unavailable.
+func (a *App) WaitForIdentityProvider(ctx context.Context) error {
+	if a.oidc == nil {
+		return nil
+	}
+	return a.oidc.WaitReady(ctx)
 }
 
 // ReloadTokens re-reads the token file and installs it.
@@ -189,7 +215,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		return nil, err
 	}
 
-	authn, err := buildAuth(cfg)
+	authn, verifier, err := buildAuth(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +231,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 
 	a := &App{
 		cfg: cfg, log: cfg.Logger, registry: reg,
-		manager: manager, router: router, metrics: met,
+		manager: manager, router: router, metrics: met, oidc: verifier,
 	}
 
 	if err := a.RestorePolicies(ctx); err != nil {
@@ -257,23 +283,23 @@ func buildLimiter(cfg Config, met *metrics.Metrics) *auth.Limiter {
 // The opt-out exists because local development and the test suite genuinely do
 // not want tokens, and an escape hatch that has to be named is very different
 // from a default that nobody chose.
-func buildAuth(cfg Config) (*auth.Authenticator, error) {
+func buildAuth(ctx context.Context, cfg Config) (*auth.Authenticator, *auth.OIDCVerifier, error) {
 	if cfg.AuthDisabled {
-		if len(cfg.Tokens) > 0 || cfg.TokenFile != "" {
+		if len(cfg.Tokens) > 0 || cfg.TokenFile != "" || cfg.OIDCIssuer != "" {
 			// Both set is ambiguous, and guessing which one the operator meant
 			// is exactly the wrong thing to do about a security control.
-			return nil, errors.New("app: tokens are configured but authentication is disabled; " +
-				"remove one or the other rather than leaving it ambiguous")
+			return nil, nil, errors.New("app: authentication is disabled but tokens or an identity " +
+				"provider are configured; remove one or the other rather than leaving it ambiguous")
 		}
 		cfg.Logger.Warn("authentication is DISABLED; the control plane is open to anyone who can reach this port")
-		return auth.Disabled(), nil
+		return auth.Disabled(), nil, nil
 	}
 
 	if cfg.TokenFile != "" && len(cfg.Tokens) > 0 {
 		// Two sources would make a reload ambiguous: re-reading the file
 		// cannot see the environment, so the running set would depend on which
 		// source was consulted last.
-		return nil, errors.New("app: set either -tokens or -token-file, not both; " +
+		return nil, nil, errors.New("app: set either -tokens or -token-file, not both; " +
 			"only the file can be reloaded without a restart")
 	}
 
@@ -281,24 +307,51 @@ func buildAuth(cfg Config) (*auth.Authenticator, error) {
 	if cfg.TokenFile != "" {
 		var err error
 		if entries, err = auth.ReadTokenFile(cfg.TokenFile); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
-	if len(entries) == 0 {
-		return nil, errors.New("app: no API tokens configured. Mint one with " +
+	// With an identity provider configured, no static tokens is a legitimate
+	// deployment: every caller is a person logging in. Without one it is the
+	// misconfiguration that would serve the control plane to anybody.
+	if len(entries) == 0 && cfg.OIDCIssuer == "" {
+		return nil, nil, errors.New("app: no API tokens configured. Mint one with " +
 			"`modelforgectl token <name> <scope>` and set MODELFORGE_TOKENS or " +
-			"-token-file, or pass -auth-disabled to run without authentication deliberately")
+			"-token-file, set -oidc-issuer for per-user login, " +
+			"or pass -auth-disabled to run without authentication deliberately")
 	}
 
-	authn, err := auth.New(entries)
+	var (
+		opts     []auth.Option
+		verifier *auth.OIDCVerifier
+	)
+	if cfg.OIDCIssuer != "" {
+		scopeMap, err := auth.ParseScopeMap(cfg.OIDCScopeMap)
+		if err != nil {
+			return nil, nil, err
+		}
+		verifier, err = auth.NewOIDCVerifier(ctx, auth.OIDCConfig{
+			Issuer:      cfg.OIDCIssuer,
+			Audience:    cfg.OIDCAudience,
+			GroupsClaim: cfg.OIDCGroupsClaim,
+			ScopeMap:    scopeMap,
+		}, cfg.Logger)
+		if err != nil {
+			return nil, nil, err
+		}
+		opts = append(opts, auth.WithOIDC(verifier))
+		cfg.Logger.Info("per-user authentication enabled",
+			"issuer", cfg.OIDCIssuer, "audience", cfg.OIDCAudience, "groups", len(scopeMap))
+	}
+
+	authn, err := auth.New(entries, opts...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, t := range authn.Tokens() {
 		cfg.Logger.Info("api token configured", "token", t.Name, "scopes", t.Scopes)
 	}
-	return authn, nil
+	return authn, verifier, nil
 }
 
 // Handler returns the HTTP handler, for tests and for main.

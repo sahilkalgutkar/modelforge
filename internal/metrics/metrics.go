@@ -29,6 +29,7 @@ type Metrics struct {
 	authThrottled prometheus.Counter
 	authReloads   *prometheus.CounterVec
 	authTokens    prometheus.Gauge
+	authByKind    *prometheus.CounterVec
 }
 
 // New registers the collectors with r.
@@ -85,6 +86,15 @@ func New(r prometheus.Registerer) *Metrics {
 			Help: "Token-set reload attempts, by outcome (applied, unchanged, failed).",
 		}, []string{"outcome"}),
 
+		authByKind: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "modelforge_authentications_total",
+			Help: "Successful authentications, by credential kind (service, user).",
+			// Kind, not identity. A per-user label would put an unbounded,
+			// externally-controlled set of values into the metric names — the
+			// same cardinality problem as labelling by client address. Who did
+			// what belongs in the audit log.
+		}, []string{"kind"}),
+
 		authTokens: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "modelforge_auth_tokens",
 			Help: "Tokens currently configured.",
@@ -98,7 +108,7 @@ func New(r prometheus.Registerer) *Metrics {
 
 	r.MustRegister(m.predictions, m.latency, m.errors, m.batchSize,
 		m.shadowComparisons, m.shadowDelta, m.driftPSI, m.authThrottled,
-		m.authReloads, m.authTokens)
+		m.authReloads, m.authTokens, m.authByKind)
 	return m
 }
 
@@ -153,6 +163,11 @@ func (m *Metrics) ObserveAuthReload(outcome string, tokens int) {
 	if tokens > 0 {
 		m.authTokens.Set(float64(tokens))
 	}
+}
+
+// ObserveAuthentication records a successful authentication by credential kind.
+func (m *Metrics) ObserveAuthentication(kind string) {
+	m.authByKind.WithLabelValues(kind).Inc()
 }
 
 // ObserveDrift publishes a drift report as gauges.
