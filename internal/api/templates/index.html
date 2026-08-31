@@ -1,0 +1,26 @@
+{{define "content"}}
+{{if not .Models}}
+  <p class="empty">No models registered yet. Push one with
+  <code>modelforgectl push &lt;model&gt; &lt;file.json&gt; &lt;features...&gt;</code>.</p>
+{{else}}
+<table>
+  <thead><tr>
+    <th>Model</th><th>Serving</th><th>Versions</th>
+    <th class="num">Requests</th><th class="num">Failures</th><th>Drift</th>
+  </tr></thead>
+  <tbody>
+  {{range .Models}}
+    <tr>
+      <td><a href="/models/{{.Name}}">{{.Name}}</a></td>
+      <td>{{if .Policy}}{{.Policy}}{{else}}<span class="empty">not deployed</span>{{end}}</td>
+      <td class="num">{{.VersionCount}}</td>
+      <td class="num">{{.Requests}}</td>
+      <td class="num {{if .Failures}}bad{{end}}">{{.Failures}}</td>
+      <td>{{if .DriftLabel}}<span class="{{.DriftClass}}">{{.DriftLabel}}</span>
+          {{else}}<span class="empty">—</span>{{end}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+{{end}}

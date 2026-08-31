@@ -1,0 +1,47 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · modelforge</title>
+{{if .Refresh}}<meta http-equiv="refresh" content="{{.Refresh}}">{{end}}
+<style>
+  :root { color-scheme: light dark; --line:#8884; --dim:#7a7a7a;
+          --ok:#1a7f37; --warn:#9a6700; --bad:#b3261e; }
+  * { box-sizing: border-box; }
+  body { font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+         margin:0; padding:0 1.5rem 4rem; }
+  header { display:flex; flex-wrap:wrap; gap:.75rem; align-items:baseline;
+           justify-content:space-between; padding:1.25rem 0; border-bottom:1px solid var(--line);
+           margin-bottom:1.5rem; }
+  .wrap { max-width:70rem; margin:0 auto; }
+  h1 { font-size:1.25rem; margin:0; }
+  h2 { font-size:1rem; margin:2rem 0 .5rem; }
+  a { color:inherit; }
+  .who { font-size:.85rem; color:var(--dim); }
+  table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }
+  th,td { text-align:left; padding:.4rem .6rem; border-bottom:1px solid var(--line); }
+  th { font-size:.75rem; text-transform:uppercase; letter-spacing:.04em; color:var(--dim);
+       font-weight:600; }
+  td.num { text-align:right; }
+  .tag { display:inline-block; padding:.05rem .4rem; border:1px solid var(--line);
+         border-radius:.25rem; font-size:.75rem; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  .empty { color:var(--dim); padding:1.5rem 0; }
+  .bar { display:inline-block; height:.55rem; background:currentColor; border-radius:.15rem;
+         vertical-align:middle; min-width:2px; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.85em; }
+  footer { margin-top:3rem; padding-top:1rem; border-top:1px solid var(--line);
+           font-size:.8rem; color:var(--dim); }
+</style>
+</head>
+<body><div class="wrap">
+<header>
+  <h1><a href="/" style="text-decoration:none">modelforge</a></h1>
+  <span class="who">{{.Identity}} · {{.Scopes}} · <a href="/logout">sign out</a></span>
+</header>
+{{template "content" .}}
+<footer>Read-only. Deployments are changed with <code>modelforgectl</code>, where they are
+scripted and audited.{{if .Refresh}} Refreshes every {{.Refresh}}s.{{end}}</footer>
+</div></body>
+</html>{{end}}

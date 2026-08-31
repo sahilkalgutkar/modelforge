@@ -595,6 +595,67 @@ from it would let somebody point the provider's callback wherever they liked.
 `-insecure-cookies` drops `Secure` for local HTTP and logs a warning saying
 exactly what that costs.
 
+### The dashboard
+
+`/` lists the models; `/models/{name}` shows one in detail. Real output from a
+running server with a 90/10 canary and a drifting feature:
+
+```
+Model         Serving          Versions  Requests  Failures  Drift
+fraud-score   v1=90% v2=10%    2         1500      0         significant
+churn-risk    not deployed     0         0         0         —
+```
+
+```
+Version  Traffic  Digest        Features  Requests  Failures  Mean batch
+v1       90%      3a0468741e67  4         1079      0         26.3
+v2       10%      3a0468741e67  4         121       0         3.1
+
+Drift · v1 over 15m0s, 1079 samples
+Feature   PSI     Severity     Missing
+amount    2.1556  significant  0.0%
+tenure    0.0957  stable       0.0%
+```
+
+The split lands where the policy says, and the mean batch sizes differ for a
+reason worth noticing: the 10% canary fills batches more slowly than the
+incumbent, so the same batching window gives it 3.1 rows a call against 26.3.
+
+**Server-rendered HTML, no JavaScript at all.** That is a decision, not a
+shortcut. `html/template` does contextual auto-escaping — it knows whether a
+value is landing in element text, an attribute or a URL — and that is the XSS
+defence. It matters more here than it would have a week ago: this server hands
+out session cookies now, so a script injected into one of these pages would run
+with somebody's session.
+
+Having no JavaScript is what makes the Content-Security-Policy meaningful:
+
+```
+default-src 'none'; style-src 'unsafe-inline'; form-action 'self';
+base-uri 'none'; frame-ancestors 'none'
+```
+
+`default-src 'none'` with no `script-src` means no script can run at all, which
+turns "everything is escaped correctly" from a claim into something the browser
+enforces independently. A test asserts the pages contain no `<script>` and no
+inline handlers, so a future addition fails loudly rather than being silently
+blocked — which is a confusing way to find out.
+
+It also means no bundler and no node in CI for a Go serving platform, and the
+binary stays the single self-contained artifact everything else here assumes.
+The templates are embedded with `go:embed` and parsed at startup, so a broken
+one fails the build rather than the first request.
+
+**A browser gets a redirect where an API client gets a 401.** That split is the
+one place the HTML surface should behave differently: a browser handed a bare
+401 has nowhere to go and no way to know a sign-in exists, while an API client
+handed a redirect follows it and tries to parse a login page as JSON. The
+redirect preserves where you were heading, and the destination is re-validated
+on the way back through the same open-redirect check.
+
+The dashboard is behind the `read` scope like any other read, so it is not a way
+around authorisation — a `predict`-only credential gets 403.
+
 ### A bug worth recording
 
 The first version left `Endpoint.AuthStyle` unset. `x/oauth2` then probes for
@@ -747,7 +808,7 @@ and a fake agrees with whatever the code happens to do.
 same database and truncate it between cases, so running packages concurrently
 has them resetting the database underneath each other.
 
-Coverage is **89.7%** of `internal/`, measured with `-coverpkg` so that code is
+Coverage is **89.1%** of `internal/`, measured with `-coverpkg` so that code is
 attributed to the package that owns it rather than the package running the test
 — without it the end-to-end suites, which exercise serving and routing through
 HTTP, would report those packages as untested.
@@ -785,6 +846,8 @@ fail silently:
 | `TestCrossSiteWriteIsRefused` | another origin acting with your session cookie |
 | `TestLoginRejectsAnOpenRedirect` | a real sign-in bouncing to an attacker's page |
 | `TestBearerTokenBeatsCookie` | an ambient session overriding an explicit credential |
+| `TestDashboardEscapesHostileContent` | a script in a model description running with your session |
+| `TestDashboardShipsNoJavaScript` | a future script tag silently blocked by the CSP |
 
 ## Known limitations
 
@@ -808,8 +871,13 @@ I would rather write these down than let someone discover them.
   the deliberate trade: the alternative writes credential-equivalent material
   into a database that is backed up, replicated and read by people debugging
   models. Losing a session costs one click.
-- **There is still no UI.** Sessions let a browser reach the API and `/metrics`;
-  they do not put a dashboard in front of them.
+- **The dashboard is read-only.** Changing what serves traffic is done with
+  `modelforgectl`, where it is scripted and audited. Putting it behind a button
+  would widen the CSRF surface to reach a mutation nobody asked to make from a
+  browser.
+- **It polls rather than streams.** A meta refresh every 15 seconds, because
+  live updates would need JavaScript and that is the one thing this page
+  deliberately does not have.
 - **A stolen credential file is worth more than it used to be.** It now holds a
   refresh token, which outlives the ID token it renews. Rotation, 0600
   permissions and revocation on logout are the mitigations; none of them make it
