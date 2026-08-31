@@ -43,6 +43,15 @@ type loginIDP struct {
 	groups    []string
 	email     string
 	issueNoID bool
+
+	// refresh tokens the provider considers live. Rotation issues a new one
+	// and retires the old, which is what OAuth 2.1 tells providers to do.
+	refresh      map[string]bool
+	rotate       bool
+	refreshCount int
+	revoked      []string
+	noRevocation bool
+	idTTL        time.Duration
 }
 
 type codeGrant struct {
@@ -58,10 +67,12 @@ func newLoginIDP(t *testing.T) *loginIDP {
 		t.Fatal(err)
 	}
 	p := &loginIDP{
-		key:    key,
-		codes:  map[string]codeGrant{},
-		groups: []string{"platform-oncall"},
-		email:  "sahil@example.com",
+		key:     key,
+		codes:   map[string]codeGrant{},
+		refresh: map[string]bool{},
+		groups:  []string{"platform-oncall"},
+		email:   "sahil@example.com",
+		idTTL:   time.Hour,
 	}
 
 	mux := http.NewServeMux()
@@ -72,8 +83,19 @@ func newLoginIDP(t *testing.T) *loginIDP {
 			"authorization_endpoint":                p.server.URL + "/authorize",
 			"token_endpoint":                        p.server.URL + "/token",
 			"jwks_uri":                              p.server.URL + "/keys",
+			"revocation_endpoint":                   p.revocationEndpoint(),
 			"id_token_signing_alg_values_supported": []string{"RS256"},
 		})
+	})
+	mux.HandleFunc("/revoke", func(w http.ResponseWriter, r *http.Request) {
+		//nolint:errcheck // test server
+		r.ParseForm()
+		tok := r.Form.Get("token")
+		p.mu.Lock()
+		p.revoked = append(p.revoked, tok)
+		delete(p.refresh, tok)
+		p.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
 		//nolint:errcheck // test server
@@ -103,6 +125,12 @@ func newLoginIDP(t *testing.T) *loginIDP {
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		//nolint:errcheck // test server
 		r.ParseForm()
+
+		if r.Form.Get("grant_type") == "refresh_token" {
+			p.serveRefresh(t, w, r)
+			return
+		}
+
 		code := r.Form.Get("code")
 
 		p.mu.Lock()
@@ -126,6 +154,12 @@ func newLoginIDP(t *testing.T) *loginIDP {
 		if !noID {
 			body["id_token"] = p.mintID(t, email, groups, grant.nonce)
 		}
+		rt := "refresh-" + code
+		p.mu.Lock()
+		p.refresh[rt] = true
+		p.mu.Unlock()
+		body["refresh_token"] = rt
+
 		w.Header().Set("Content-Type", "application/json")
 		//nolint:errcheck // test server
 		json.NewEncoder(w).Encode(body)
@@ -136,7 +170,60 @@ func newLoginIDP(t *testing.T) *loginIDP {
 	return p
 }
 
+func (p *loginIDP) revocationEndpoint() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.noRevocation {
+		return ""
+	}
+	return p.server.URL + "/revoke"
+}
+
+// serveRefresh handles a refresh_token grant, honouring rotation.
+func (p *loginIDP) serveRefresh(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	presented := r.Form.Get("refresh_token")
+
+	p.mu.Lock()
+	live := p.refresh[presented]
+	if live {
+		p.refreshCount++
+	}
+	rotate, groups, email, ttl := p.rotate, p.groups, p.email, p.idTTL
+	next := presented
+	if live && rotate {
+		delete(p.refresh, presented)
+		next = presented + "-rotated"
+		p.refresh[next] = true
+	}
+	p.mu.Unlock()
+
+	if !live {
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(w, `{"error":"invalid_grant","error_description":"refresh token is not valid"}`,
+			http.StatusBadRequest)
+		return
+	}
+
+	body := map[string]any{
+		"access_token": "opaque", "token_type": "Bearer",
+		"expires_in": int(ttl.Seconds()),
+		"id_token":   p.mintIDWithTTL(t, email, groups, "", ttl),
+	}
+	if rotate {
+		body["refresh_token"] = next
+	}
+	w.Header().Set("Content-Type", "application/json")
+	//nolint:errcheck // test server
+	json.NewEncoder(w).Encode(body)
+}
+
 func (p *loginIDP) mintID(t *testing.T, email string, groups []string, nonce string) string {
+	t.Helper()
+	return p.mintIDWithTTL(t, email, groups, nonce, time.Hour)
+}
+
+func (p *loginIDP) mintIDWithTTL(t *testing.T, email string, groups []string, nonce string, ttl time.Duration) string {
 	t.Helper()
 	signer, err := jose.NewSigner(
 		jose.SigningKey{Algorithm: jose.RS256, Key: p.key},
@@ -149,7 +236,7 @@ func (p *loginIDP) mintID(t *testing.T, email string, groups []string, nonce str
 	claims := map[string]any{
 		"iss": p.server.URL, "aud": "modelforge", "sub": "sub-" + email,
 		"email": email, "groups": groups,
-		"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
+		"iat": now.Unix(), "exp": now.Add(ttl).Unix(),
 	}
 	if nonce != "" {
 		claims["nonce"] = nonce
@@ -246,7 +333,7 @@ func TestLoginEndToEnd(t *testing.T) {
 	// The credential is stored and a fresh client picks it up without any
 	// environment variable.
 	stored := LoadCredential()
-	if stored == "" {
+	if !stored.Valid() {
 		t.Fatal("no credential was stored")
 	}
 	if out2, code := run(t, addr, "whoami"); code != 0 ||
@@ -268,7 +355,7 @@ func TestStoredCredentialIsPrivate(t *testing.T) {
 	path := filepath.Join(dir, "nested", "credential")
 	t.Setenv("MODELFORGE_CREDENTIAL_FILE", path)
 
-	if err := SaveCredential("a-token"); err != nil {
+	if err := SaveCredential(Credential{IDToken: "a-token"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -294,7 +381,7 @@ func TestStoredCredentialIsPrivate(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("MODELFORGE_CREDENTIAL_FILE", filepath.Join(loose, "credential"))
-	if err := SaveCredential("another"); err != nil {
+	if err := SaveCredential(Credential{IDToken: "another"}); err != nil {
 		t.Fatal(err)
 	}
 	di, _ = os.Stat(loose)
@@ -377,7 +464,7 @@ func TestCallbackRejectsAForgedState(t *testing.T) {
 	if !strings.Contains(err.Error(), "state") {
 		t.Errorf("error should name the state mismatch: %v", err)
 	}
-	if LoadCredential() != "" {
+	if LoadCredential().Valid() {
 		t.Error("a failed login stored a credential anyway")
 	}
 }
@@ -475,32 +562,28 @@ func TestLogoutRemovesTheCredential(t *testing.T) {
 	c := NewClient("http://localhost:1", &out)
 
 	// Nothing stored yet.
-	if err := c.Logout(); err != nil {
+	if err := c.Logout(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "no stored login") {
 		t.Errorf("logout with nothing stored: %s", out.String())
 	}
 
-	if err := SaveCredential("a-token"); err != nil {
+	if err := SaveCredential(Credential{IDToken: "a-token"}); err != nil {
 		t.Fatal(err)
 	}
 	out.Reset()
-	if err := c.Logout(); err != nil {
+	if err := c.Logout(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if LoadCredential() != "" {
+	if LoadCredential().Valid() {
 		t.Error("the credential survived logout")
-	}
-	// Worth saying plainly, because deleting a local file is not revocation.
-	if !strings.Contains(out.String(), "stays valid until it expires") {
-		t.Errorf("logout should say the token is not revoked:\n%s", out.String())
 	}
 }
 
 func TestEnvironmentTokenOverridesAStoredLogin(t *testing.T) {
 	t.Setenv("MODELFORGE_CREDENTIAL_FILE", filepath.Join(t.TempDir(), "credential"))
-	if err := SaveCredential("stored-token"); err != nil {
+	if err := SaveCredential(Credential{IDToken: "stored-token"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -579,25 +662,31 @@ func TestSaveCredentialRejectsAnUnusablePath(t *testing.T) {
 	}
 	t.Setenv("MODELFORGE_CREDENTIAL_FILE", filepath.Join(file, "sub", "credential"))
 
-	if err := SaveCredential("token"); err == nil {
+	if err := SaveCredential(Credential{IDToken: "token"}); err == nil {
 		t.Fatal("SaveCredential succeeded under a regular file")
 	}
 }
 
 func TestLoadCredentialWithNoFile(t *testing.T) {
 	t.Setenv("MODELFORGE_CREDENTIAL_FILE", filepath.Join(t.TempDir(), "absent"))
-	if got := LoadCredential(); got != "" {
-		t.Errorf("LoadCredential with no file = %q, want empty", got)
+	if got := LoadCredential(); got.Valid() {
+		t.Errorf("LoadCredential with no file = %+v, want empty", got)
 	}
-	// Whitespace and a trailing newline are trimmed, since the file is written
-	// with one and people edit these by hand.
+
+	// A bare token is what older versions wrote. Reading it keeps somebody who
+	// upgrades signed in rather than logging them out for a format change they
+	// did not ask for.
 	path := filepath.Join(t.TempDir(), "credential")
 	t.Setenv("MODELFORGE_CREDENTIAL_FILE", path)
 	if err := os.WriteFile(path, []byte("  a-token\n\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := LoadCredential(); got != "a-token" {
-		t.Errorf("LoadCredential = %q, want the trimmed token", got)
+	got := LoadCredential()
+	if got.IDToken != "a-token" {
+		t.Errorf("LoadCredential = %+v, want the trimmed bare token", got)
+	}
+	if got.CanRefresh() {
+		t.Error("a bare token was reported as refreshable")
 	}
 }
 

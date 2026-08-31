@@ -463,8 +463,61 @@ deliberately unauthenticated: a client cannot present a credential before it
 knows where to obtain one, and every value there is visible to anybody watching
 a browser perform a login.
 
-`logout` deletes the local file and says plainly that this is **not**
-revocation — the token stays valid at the provider until it expires.
+### Sessions renew themselves
+
+`login` requests `offline_access`, and the stored credential carries a refresh
+token. An expiring session is renewed before the command that needed it runs,
+so nothing fails first:
+
+```
+$ modelforgectl whoami        # ID token has 55s left
+sahil@example.com (user)      # renewed transparently; no sign-in
+```
+
+**Renewal is proactive, not on a 401.** Reacting to a rejection means the first
+call after expiry always fails once, and "it works on the second try" is a bad
+habit for a tool to teach. The margin is 60 seconds, covering clock skew against
+the provider plus the time the request itself spends in flight — a token with
+two seconds left is not usable even though it has not technically expired. A
+credential that is still fresh never touches the provider at all.
+
+**Rotation is honoured.** A provider that issues a new refresh token on every
+use — which is what OAuth 2.1 tells them to do — retires the old one. Storing
+only the original works perfectly until it doesn't, so whatever comes back is
+kept. Three chained renewals are tested precisely because each depends on the
+previous one having been stored.
+
+**Concurrent commands do not break the session.** Two invocations at once would
+both see a stale token and both refresh; against a rotating provider the second
+invalidates the first, and whichever writes last leaves a credential the other
+already broke. The symptom is a login that mysteriously dies when somebody runs
+two commands in parallel. Refresh happens under a file lock, and re-reads the
+credential inside it so a process that waited uses what the winner wrote. Tested
+with eight concurrent workers against a rotating provider: exactly one refresh,
+and the session still works.
+
+Writes are atomic — temp file plus rename, the same as the artifact store —
+because a crash partway through would otherwise leave a truncated token where a
+valid one was, which fails in a way that looks like a server problem.
+
+### Logging out actually revokes
+
+I added a longer-lived secret, so I added a way to withdraw it. `logout` calls
+the provider's RFC 7009 revocation endpoint before deleting the local file:
+
+```
+$ modelforgectl logout
+revoked this session at the identity provider
+removed the stored login from this machine
+```
+
+Verified by putting the deleted credential *back* afterwards — the provider
+rejects it, so the session is genuinely dead rather than merely forgotten
+locally.
+
+A provider with no revocation endpoint is reported plainly rather than glossed,
+because "logged out" quietly meaning two different things depending on the
+provider is how somebody ends up believing a credential is dead when it is not.
 
 ### A bug worth recording
 
@@ -618,7 +671,7 @@ and a fake agrees with whatever the code happens to do.
 same database and truncate it between cases, so running packages concurrently
 has them resetting the database underneath each other.
 
-Coverage is **90.9%** of `internal/`, measured with `-coverpkg` so that code is
+Coverage is **90.4%** of `internal/`, measured with `-coverpkg` so that code is
 attributed to the package that owns it rather than the package running the test
 — without it the end-to-end suites, which exercise serving and routing through
 HTTP, would report those packages as untested.
@@ -650,6 +703,9 @@ fail silently:
 | `TestPKCEIsActuallySent` | a login flow shipping without PKCE |
 | `TestCallbackRejectsAForgedState` | a forged callback completing somebody else's login |
 | `TestStoredCredentialIsPrivate` | a world-readable credential in a home directory |
+| `TestRotatedRefreshTokenIsStored` | a session that works until the old token is retired |
+| `TestConcurrentRefreshDoesNotBreakTheSession` | two parallel commands invalidating each other's token |
+| `TestLogoutRevokesAtTheProvider` | "logged out" leaving a working credential alive |
 
 ## Known limitations
 
@@ -674,9 +730,13 @@ I would rather write these down than let someone discover them.
   sign-in page, so a browser pointed straight at the API gets a 401 rather than
   a redirect. Adding sessions would mean cookie handling and CSRF defence for
   the sake of an API with no UI in front of it.
-- **There is no refresh.** When the token expires you log in again. Storing a
-  refresh token on disk is a longer-lived secret than the one it replaces, and
-  the sessions here are hours rather than minutes.
+- **A stolen credential file is worth more than it used to be.** It now holds a
+  refresh token, which outlives the ID token it renews. Rotation, 0600
+  permissions and revocation on logout are the mitigations; none of them make it
+  free.
+- **Renewal needs the provider reachable.** An expired session on a machine that
+  cannot reach the identity provider cannot be renewed, where a static token
+  would still work.
 - **Static-token revocation is as fast as the reload.** A withdrawn token stops
   working on the next `SIGHUP` or within the poll interval, not instantly across
   a fleet. OIDC logins do not have this problem — they expire on their own.

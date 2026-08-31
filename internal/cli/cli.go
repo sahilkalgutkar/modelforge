@@ -50,11 +50,14 @@ func NewClient(baseURL string, out io.Writer) *Client {
 }
 
 // credential resolves which token to send.
+//
+// The environment wins over a stored login, so a script can override whoever
+// happens to be signed in on the machine it runs on.
 func credential() string {
 	if t := os.Getenv("MODELFORGE_TOKEN"); t != "" {
 		return t
 	}
-	return LoadCredential()
+	return LoadCredential().IDToken
 }
 
 // Usage is the help text.
@@ -100,6 +103,19 @@ func Run(args []string, addr string, out io.Writer) int {
 		return 2
 	}
 	c := NewClient(addr, out)
+
+	// Renewed before the command runs rather than after a request fails. A
+	// reactive refresh means the first call after expiry always fails once,
+	// and "it works on the second try" is a bad thing for a tool to teach.
+	//
+	// login and logout are exempt: neither needs a live session, and refusing
+	// to let somebody log out because their session expired would be absurd.
+	if args[0] != "login" && args[0] != "logout" && os.Getenv("MODELFORGE_TOKEN") == "" {
+		if rerr := c.EnsureFresh(context.Background()); rerr != nil {
+			fmt.Fprintf(out, "error: %v\n", rerr)
+			return 1
+		}
+	}
 
 	var err error
 	switch args[0] {
@@ -177,7 +193,7 @@ func Run(args []string, addr string, out io.Writer) int {
 		}
 		err = c.Login(context.Background(), open)
 	case "logout":
-		err = c.Logout()
+		err = c.Logout(context.Background())
 	case "whoami":
 		err = c.WhoAmI()
 	case "token":
