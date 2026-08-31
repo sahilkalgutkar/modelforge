@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -136,6 +137,12 @@ func NewServer(deps Deps) *Server {
 	// The dashboard. Read-only, and behind the read scope like any other read.
 	s.mux.Handle("GET /{$}", s.dashboardEntry(s.handleDashboard))
 	s.mux.Handle("GET /models/{model}", s.dashboardEntry(s.handleModelPage))
+
+	// Deploy actions. Behind the admin scope, like the JSON route that does
+	// the same thing, and CSRF-checked by the middleware because they are
+	// state-changing methods.
+	s.mux.Handle("POST /models/{model}/plan", mw.RequireFunc(auth.ScopeAdmin, s.handlePlanAction))
+	s.mux.Handle("POST /models/{model}/apply", mw.RequireFunc(auth.ScopeAdmin, s.handleApplyAction))
 
 	// Operations. Deliberately unauthenticated.
 	//
@@ -409,26 +416,34 @@ func (s *Server) handleSetPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.applyPolicy(r.Context(), model, p); err != nil {
+		writeRegistryError(w, err)
+		return
+	}
+	s.deps.Logger.Info("policy updated", "model", model, "policy", p.String())
+	writeJSON(w, http.StatusOK, p)
+}
+
+// applyPolicy installs a traffic policy.
+//
+// Shared by the JSON API and the dashboard so both do exactly the same thing.
+// Two code paths that both change what serves production traffic is two places
+// for the rules to drift, and the one with fewer checks becomes the way an
+// unloadable version reaches the router.
+func (s *Server) applyPolicy(ctx context.Context, model string, p routing.Policy) error {
 	// Every version the policy names must be loadable before the policy is
 	// installed. Installing first would create a window in which traffic is
 	// routed to a version that cannot serve it, and the failure would land on
 	// callers rather than on the person making the change.
 	for _, v := range p.Versions() {
-		if err := s.deps.Manager.Load(r.Context(), model, v); err != nil {
-			writeRegistryError(w, fmt.Errorf("cannot activate version %d: %w", v, err))
-			return
+		if err := s.deps.Manager.Load(ctx, model, v); err != nil {
+			return fmt.Errorf("cannot activate version %d: %w", v, err)
 		}
 	}
-	if err := s.deps.Registry.SavePolicy(r.Context(), model, p); err != nil {
-		writeRegistryError(w, err)
-		return
+	if err := s.deps.Registry.SavePolicy(ctx, model, p); err != nil {
+		return err
 	}
-	if err := s.deps.Router.SetPolicy(p); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	s.deps.Logger.Info("policy updated", "model", model, "policy", p.String())
-	writeJSON(w, http.StatusOK, p)
+	return s.deps.Router.SetPolicy(p)
 }
 
 func (s *Server) handleGetPolicy(w http.ResponseWriter, r *http.Request) {

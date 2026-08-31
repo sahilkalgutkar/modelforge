@@ -22,8 +22,9 @@ var templateFS embed.FS
 // mistake in a file that ships inside the binary, so failing here rather than on
 // the first request is right: it cannot be caused by anything a user does.
 var (
-	indexTemplate = template.Must(template.ParseFS(templateFS, "templates/layout.html", "templates/index.html"))
-	modelTemplate = template.Must(template.ParseFS(templateFS, "templates/layout.html", "templates/model.html"))
+	indexTemplate   = template.Must(template.ParseFS(templateFS, "templates/layout.html", "templates/index.html"))
+	modelTemplate   = template.Must(template.ParseFS(templateFS, "templates/layout.html", "templates/model.html"))
+	confirmTemplate = template.Must(template.ParseFS(templateFS, "templates/layout.html", "templates/confirm.html"))
 )
 
 // The dashboard is server-rendered HTML with no JavaScript at all, which is a
@@ -41,10 +42,9 @@ var (
 // for a Go serving platform, and the binary stays the single self-contained
 // artifact the rest of the design depends on.
 //
-// And it is read-only. Changing what serves production traffic is a deliberate,
-// audited act that already has a tested CLI; putting it behind a button would
-// widen the CSRF surface to reach a mutation that nobody was asking to make
-// from a browser.
+// Deploy actions arrive as ordinary form posts, which is the reason the CSRF
+// check accepts a form field as well as a header: a page with no JavaScript
+// cannot set a header.
 
 // dashboardRefresh is how often a page reloads itself, in seconds. Done with a
 // meta refresh rather than a script, so the no-JavaScript policy holds.
@@ -59,6 +59,25 @@ type pageData struct {
 	Model    modelDetail
 	Versions []versionRow
 	Drift    []driftPanel
+
+	// CanDeploy gates the action forms on the viewer's scope, so a read-only
+	// credential is not shown buttons that would refuse it.
+	CanDeploy bool
+	HasShadow bool
+	CSRF      string
+	Confirm   *confirmData
+}
+
+type confirmData struct {
+	Model    string
+	Summary  string
+	Before   string
+	After    string
+	Expected string
+	Action   string
+	Version  string
+	Percent  string
+	Stable   string
 }
 
 type modelRow struct {
@@ -188,7 +207,10 @@ func (s *Server) handleModelPage(w http.ResponseWriter, r *http.Request) {
 	policy, deployed := s.deps.Router.Policy(name)
 	data := pageData{
 		Title: model.Name, Identity: tok.Name, Scopes: scopeSummary(tok), Refresh: dashboardRefresh,
-		Model: modelDetail{Name: model.Name, Description: model.Description},
+		Model:     modelDetail{Name: model.Name, Description: model.Description},
+		CanDeploy: tok.Allows(auth.ScopeAdmin),
+		HasShadow: deployed && policy.Shadow != nil,
+		CSRF:      csrfValue(r),
 	}
 	if deployed {
 		data.Model.Policy = policy.String()

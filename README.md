@@ -656,6 +656,72 @@ on the way back through the same open-redirect check.
 The dashboard is behind the `read` scope like any other read, so it is not a way
 around authorisation — a `predict`-only credential gets 403.
 
+### Deploying from the dashboard
+
+Deploy, canary, shadow and rollback are available as forms. Every one is two
+steps — a plan that says exactly what will change, then an apply that carries it
+out:
+
+```
+Confirm this change to fraud-score
+Send 10% of traffic to version 2, keeping 90% on version 1.
+
+Now          After
+v1=100%      v1=90% v2=10%
+
+This changes which model answers live requests, immediately.
+```
+
+**A single button that immediately moved traffic would be the wrong shape.**
+These operations decide which model answers every request, they are being
+triggered by a mouse rather than a reviewed script, and the cost of a mis-click
+is wrong predictions rather than an error message. The confirmation is where
+somebody sees "90/10 becomes 100% v2" before it is true.
+
+**Two operators cannot silently overwrite each other.** The policy as it stood
+when the confirmation was rendered is carried in the form, and apply refuses if
+it no longer matches:
+
+```
+This model changed while you were looking at it. It was "v1=100%" when the
+confirmation was shown and is "v1=90% v2=10%" now, so nothing was applied.
+```
+
+Without that, the later click wins by arriving later and the person whose change
+was discarded has no way to know. The label doubles as the comparison token, and
+is order-independent so two policies that mean the same thing compare equal.
+
+**This is why the CSRF check accepts a form field.** A page with no JavaScript
+cannot set a header, so `csrf_token` in the body is the standard alternative —
+equally safe, because what makes double-submit work is that a cross-site
+attacker cannot *read* the cookie, and that holds wherever the value comes back.
+Only form-encoded bodies are parsed for it: calling `ParseForm` on a JSON request
+would consume the body the handler is about to decode, so a convenience for HTML
+forms would have silently broken every API POST.
+
+Verified against a running server: a form post with no token gets
+
+```
+403 auth: CSRF check failed: no X-CSRF-Token header or csrf_token field
+```
+
+**Both surfaces share one code path.** The dashboard calls the same
+`applyPolicy` the JSON API does, so a version that cannot load is refused
+identically and a shadow is carried across the same way. Two paths that both
+change what serves production traffic would be two places for the rules to
+drift, and the one with fewer checks becomes the way in.
+
+The forms are behind the `admin` scope and are not rendered at all for a
+read-only credential — showing buttons that always refuse is worse than not
+showing them. Apply redirects afterwards, so a refresh does not re-apply. And
+the audit line records the effect, not just the route:
+
+```
+{"msg":"policy changed from the dashboard","actor":"sahil@example.com",
+ "model":"fraud-score","summary":"Send 10% of traffic to version 2...",
+ "before":"v1=100%","after":"v1=90% v2=10%"}
+```
+
 ### A bug worth recording
 
 The first version left `Endpoint.AuthStyle` unset. `x/oauth2` then probes for
@@ -848,6 +914,8 @@ fail silently:
 | `TestBearerTokenBeatsCookie` | an ambient session overriding an explicit credential |
 | `TestDashboardEscapesHostileContent` | a script in a model description running with your session |
 | `TestDashboardShipsNoJavaScript` | a future script tag silently blocked by the CSP |
+| `TestConcurrentEditIsRefused` | one operator's deploy silently discarding another's |
+| `TestDeployActionWithoutCSRFIsRefused` | a cross-site page moving production traffic |
 
 ## Known limitations
 
@@ -871,10 +939,10 @@ I would rather write these down than let someone discover them.
   the deliberate trade: the alternative writes credential-equivalent material
   into a database that is backed up, replicated and read by people debugging
   models. Losing a session costs one click.
-- **The dashboard is read-only.** Changing what serves traffic is done with
-  `modelforgectl`, where it is scripted and audited. Putting it behind a button
-  would widen the CSRF surface to reach a mutation nobody asked to make from a
-  browser.
+- **Deploy actions have no approval step beyond the person clicking.** The
+  confirmation shows what will change, but one admin can move production traffic
+  alone. Four-eyes review would need a request-and-approve workflow, which is a
+  different feature.
 - **It polls rather than streams.** A meta refresh every 15 seconds, because
   live updates would need JavaScript and that is the one thing this page
   deliberately does not have.
