@@ -116,10 +116,23 @@ func NewServer(deps Deps) *Server {
 
 // middleware builds the guard used for every authenticated route.
 func (s *Server) middleware() *auth.Middleware {
+	var mw *auth.Middleware
 	if s.deps.Limiter == nil {
-		return auth.NewMiddleware(s.deps.Auth, s.deps.Logger)
+		mw = auth.NewMiddleware(s.deps.Auth, s.deps.Logger)
+	} else {
+		mw = auth.WithLimiter(s.deps.Auth, s.deps.Logger, s.deps.Limiter, s.deps.TrustForwardedFor)
 	}
-	return auth.WithLimiter(s.deps.Auth, s.deps.Logger, s.deps.Limiter, s.deps.TrustForwardedFor)
+	if r, ok := s.deps.Metrics.(AuthRecorder); ok && r != nil {
+		mw.OnAuthenticated = r.ObserveAuthentication
+	}
+	return mw
+}
+
+// AuthRecorder is the optional half of Recorder that counts authentications.
+// It is a separate interface so a Recorder that predates it still satisfies
+// Deps.Metrics.
+type AuthRecorder interface {
+	ObserveAuthentication(kind string)
 }
 
 // MetricsHandler wraps a metrics handler in the read scope.

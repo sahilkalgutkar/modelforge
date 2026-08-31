@@ -70,6 +70,18 @@ type Token struct {
 	Name   string
 	Scopes []Scope
 
+	// Subject, Issuer and Email carry a human identity when the credential
+	// came from an identity provider, and are empty for a static token.
+	//
+	// Subject is the stable identifier and Name is the readable one, kept
+	// separately on purpose: an email is what makes an audit log answerable
+	// without a directory lookup, but it changes when somebody's surname does,
+	// and a subject does not. Recording both means the log stays readable and
+	// still joins correctly a year later.
+	Subject string
+	Issuer  string
+	Email   string
+
 	// NotAfter is when this credential stops being accepted. The zero value
 	// means it never expires.
 	//
@@ -99,6 +111,11 @@ func (t Token) Allows(want Scope) bool {
 	}
 	return false
 }
+
+// Human reports whether this credential identifies a person rather than a
+// service. It is what lets an audit line distinguish "the CI token did this"
+// from "this person did this".
+func (t Token) Human() bool { return t.Subject != "" }
 
 // String renders a token for logs. It deliberately cannot print a secret,
 // because there is none in the struct to print.
@@ -147,6 +164,19 @@ type Authenticator struct {
 	disabled bool
 
 	now func() time.Time
+
+	// oidc authenticates JWTs from an identity provider, when one is
+	// configured. Static tokens and per-user logins coexist deliberately: a
+	// service calling the serving endpoint a thousand times a second wants a
+	// credential it holds, not an interactive login, and a person changing
+	// what serves production traffic should be named in the audit log rather
+	// than sharing a token with everybody else who has it.
+	oidc *OIDCVerifier
+}
+
+// WithOIDC adds per-user authentication against an identity provider.
+func WithOIDC(v *OIDCVerifier) Option {
+	return func(a *Authenticator) { a.oidc = v }
 }
 
 // Option configures an Authenticator.
@@ -193,6 +223,14 @@ func New(entries []string, opts ...Option) (*Authenticator, error) {
 	a := &Authenticator{now: time.Now}
 	for _, o := range opts {
 		o(a)
+	}
+
+	// With an identity provider configured, having no static tokens is a
+	// legitimate deployment rather than a misconfiguration: every caller is a
+	// person logging in. Without one it is the mistake buildSet refuses.
+	if len(entries) == 0 && a.oidc != nil {
+		a.set.Store(&tokenSet{byDigest: map[string]Token{}, loadedAt: a.now()})
+		return a, nil
 	}
 
 	set, err := buildSet(entries, a.now())
@@ -425,6 +463,19 @@ func (a *Authenticator) Authenticate(r *http.Request) (Token, error) {
 	// only thing the timing can reveal is hit or miss — which the response
 	// already says out loud. Adding subtle.ConstantTimeCompare after this
 	// lookup would compare a value against itself and prove nothing.
+	// A JWS has three dot-separated segments; the tokens this server mints are
+	// base64url with no dots. The two are unambiguous without parsing either,
+	// which keeps a mistyped static token from having an RSA signature
+	// verification attempted against it — wasted work on exactly the requests
+	// an attacker controls.
+	if looksLikeJWT(presented) {
+		if a.oidc == nil {
+			return Token{}, fmt.Errorf("%w: this looks like a JWT, but no identity provider is configured",
+				ErrBadCredential)
+		}
+		return a.oidc.Verify(r.Context(), presented)
+	}
+
 	tok, found := a.set.Load().byDigest[Digest(presented)]
 	if !found {
 		return Token{}, ErrBadCredential

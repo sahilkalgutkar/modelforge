@@ -35,11 +35,24 @@ func main() {
 		"authentication failures one client may make before being throttled (negative disables throttling)")
 	flag.DurationVar(&cfg.AuthFailureWindow, "auth-failure-window", time.Minute,
 		"how long an exhausted authentication-failure budget takes to refill")
+	flag.StringVar(&cfg.OIDCIssuer, "oidc-issuer", os.Getenv("MODELFORGE_OIDC_ISSUER"),
+		"identity provider URL, enabling per-user login alongside static tokens")
+	flag.StringVar(&cfg.OIDCAudience, "oidc-audience", os.Getenv("MODELFORGE_OIDC_AUDIENCE"),
+		"value a token's aud claim must contain; required with -oidc-issuer")
+	flag.StringVar(&cfg.OIDCGroupsClaim, "oidc-groups-claim", envOr("MODELFORGE_OIDC_GROUPS_CLAIM", "groups"),
+		"claim carrying group membership")
+	scopeMap := flag.String("oidc-scope-map", os.Getenv("MODELFORGE_OIDC_SCOPE_MAP"),
+		"comma-separated group=scope[+scope] entries, e.g. platform-oncall=admin,ml-eng=read")
 	flag.BoolVar(&cfg.TrustForwardedFor, "trust-forwarded-for", os.Getenv("MODELFORGE_TRUST_FORWARDED_FOR") == "true",
 		"rate-limit on X-Forwarded-For instead of the socket address; only safe behind a proxy that overwrites it")
 	flag.Parse()
 
 	cfg.AuthDisabled = *authDisabled
+	for _, e := range strings.Split(*scopeMap, ",") {
+		if e = strings.TrimSpace(e); e != "" {
+			cfg.OIDCScopeMap = append(cfg.OIDCScopeMap, e)
+		}
+	}
 	for _, t := range strings.Split(*tokens, ",") {
 		if t = strings.TrimSpace(t); t != "" {
 			cfg.Tokens = append(cfg.Tokens, t)
