@@ -36,6 +36,10 @@ type Deps struct {
 	Logger   *slog.Logger
 	// Auth guards the routes. A nil Auth is treated as explicitly disabled.
 	Auth *auth.Authenticator
+	// Limiter throttles clients that keep failing authentication. Optional.
+	Limiter *auth.Limiter
+	// TrustForwardedFor selects which address the limiter keys on.
+	TrustForwardedFor bool
 	// Metrics is optional; a nil Metrics means the handlers do not record.
 	Metrics Recorder
 }
@@ -65,7 +69,7 @@ func NewServer(deps Deps) *Server {
 		deps.Auth = auth.Disabled()
 	}
 	s := &Server{deps: deps, mux: http.NewServeMux()}
-	mw := auth.NewMiddleware(deps.Auth, deps.Logger)
+	mw := s.middleware()
 
 	// Serving. Separate from read on purpose: the credential a high-volume
 	// caller ships to production should be able to score and nothing else, so
@@ -110,6 +114,14 @@ func NewServer(deps Deps) *Server {
 	return s
 }
 
+// middleware builds the guard used for every authenticated route.
+func (s *Server) middleware() *auth.Middleware {
+	if s.deps.Limiter == nil {
+		return auth.NewMiddleware(s.deps.Auth, s.deps.Logger)
+	}
+	return auth.WithLimiter(s.deps.Auth, s.deps.Logger, s.deps.Limiter, s.deps.TrustForwardedFor)
+}
+
 // MetricsHandler wraps a metrics handler in the read scope.
 //
 // /metrics is protected because it is not neutral: it carries every model name,
@@ -118,7 +130,7 @@ func NewServer(deps Deps) *Server {
 // token from its scrape config, so the cost of protecting it is one line of
 // configuration.
 func (s *Server) MetricsHandler(h http.Handler) http.Handler {
-	return auth.NewMiddleware(s.deps.Auth, s.deps.Logger).Require(auth.ScopeRead, h)
+	return s.middleware().Require(auth.ScopeRead, h)
 }
 
 // Handler returns the HTTP handler.

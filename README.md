@@ -319,6 +319,58 @@ line per prediction. At serving volume that is millions of audit entries a day
 burying the handful that record an actual change. Twenty predictions now produce
 zero audit lines; one policy change produces one.
 
+### Repeated failures are throttled
+
+A client that keeps failing authentication gets a burst of attempts, then `429`
+with `Retry-After` until its budget refills.
+
+**What this is for, precisely.** It is not brute-force protection, and claiming
+otherwise would be the security theatre I said I wanted to avoid: the tokens are
+256 bits of randomness, so an attacker at a million guesses a second is not
+finding one, and a rate limit does not change that arithmetic at all.
+
+What it bounds is the **cost of failures**. Every rejection runs the HTTP stack,
+a hash, and — the expensive part — writes a log line containing
+attacker-controlled request data. Unbounded, that is a free way to fill a disk,
+run up a log-ingest bill, and bury the entries an operator needs during an
+incident. Measured on a live server, 200 requests with a bad token:
+
+```
+195 × 429, 5 × 401          # burst of 5, then throttled
+6 log lines total           # 5 rejections + 1 throttle notice, not 200
+```
+
+**A valid credential is never throttled.** Authentication runs *before* the
+limit check, deliberately. Checking the limit first is marginally cheaper — it
+skips a SHA-256 over a short string — but an IP is a shared resource, and behind
+a NAT or a shared egress that would refuse a correct credential because a
+neighbour is failing. That is an outage for somebody who did nothing wrong,
+bought with a saving too small to measure. Verified live: a valid token from a
+fully throttled address still returns 200.
+
+**A 403 does not count against the budget.** A valid token refused for lacking a
+scope is a misconfigured client, not somebody guessing, and throttling it would
+take a deploy script offline for holding the wrong role.
+
+**The tracking table is bounded**, because a map keyed on client address is
+otherwise its own denial of service. It is capped, and sweeps buckets that have
+fully refilled — lossless, since a refilled bucket is indistinguishable from an
+absent one. If the table saturates it **fails open**: refusing to track a new
+client and denying it instead would let an attacker fill the table and lock
+everybody out, which is the outage the limiter exists to prevent.
+
+`modelforge_auth_throttled_total` counts clients newly throttled. The address is
+not a label — it is attacker-controlled and unbounded, so labelling by it would
+let anybody mint arbitrary time series and take the monitoring down, which is
+worse than the failed logins it describes. The address goes in the log line,
+where a high-cardinality value belongs.
+
+Tune with `-auth-max-failures` and `-auth-failure-window`; `-auth-max-failures=-1`
+turns it off for deployments that do this upstream. Behind a proxy, set
+`-trust-forwarded-for` — without it every request carries the proxy's address and
+shares one bucket, and with it the header is trusted, so it is only safe when a
+proxy overwrites it.
+
 ## Observability
 
 ```bash
@@ -353,7 +405,7 @@ and a fake agrees with whatever the code happens to do.
 same database and truncate it between cases, so running packages concurrently
 has them resetting the database underneath each other.
 
-Coverage is **91.2%** of `internal/`, measured with `-coverpkg` so that code is
+Coverage is **91.6%** of `internal/`, measured with `-coverpkg` so that code is
 attributed to the package that owns it rather than the package running the test
 — without it the end-to-end suites, which exercise serving and routing through
 HTTP, would report those packages as untested.
@@ -374,6 +426,8 @@ fail silently:
 | `TestEveryRouteEnforcesItsScope` | a route shipped without a scope |
 | `TestStartupFailsClosedWithoutTokens` | a server serving its control plane to anyone |
 | `TestOnlyControlPlaneChangesAreAudited` | an audit log drowned in one line per prediction |
+| `TestAValidCredentialIsNeverThrottled` | a shared IP turning a rate limit into an outage |
+| `TestSaturatedTableFailsOpen` | an attacker filling the limiter's table to lock others out |
 
 ## Known limitations
 
@@ -397,10 +451,13 @@ I would rather write these down than let someone discover them.
   editing the server's configuration and restarting, which is fine for a handful
   of long-lived credentials and wrong for per-user tokens. Short-lived
   credentials would want OIDC and a JWKS endpoint, which is a different design.
-- **There is no rate limiting on failed authentication.** A wrong token is
-  rejected in constant work, but nothing slows down an attacker trying many —
-  that belongs at the gateway, and pretending otherwise here would be security
-  theatre.
+- **Rate limiting keys on the client address, which is a shared resource.**
+  Behind a NAT everyone shares a bucket, so a burst of 10 is per egress rather
+  than per person. A valid credential is never refused, which is what keeps that
+  from being an outage — but it does mean the limit is coarser than it looks.
+- **It is not a substitute for volumetric defence.** It bounds the cost of
+  failures reaching this process; it does nothing about the traffic arriving.
+  A gateway is still the right place for that.
 
 ## Layout
 

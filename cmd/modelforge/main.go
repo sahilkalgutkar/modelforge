@@ -27,6 +27,12 @@ func main() {
 		"comma-separated API tokens as name:scopes:sha256hex (mint with `modelforgectl token`)")
 	authDisabled := flag.Bool("auth-disabled", os.Getenv("MODELFORGE_AUTH_DISABLED") == "true",
 		"serve with no authentication at all")
+	flag.IntVar(&cfg.AuthMaxFailures, "auth-max-failures", 10,
+		"authentication failures one client may make before being throttled (negative disables throttling)")
+	flag.DurationVar(&cfg.AuthFailureWindow, "auth-failure-window", time.Minute,
+		"how long an exhausted authentication-failure budget takes to refill")
+	flag.BoolVar(&cfg.TrustForwardedFor, "trust-forwarded-for", os.Getenv("MODELFORGE_TRUST_FORWARDED_FOR") == "true",
+		"rate-limit on X-Forwarded-For instead of the socket address; only safe behind a proxy that overwrites it")
 	flag.Parse()
 
 	cfg.AuthDisabled = *authDisabled

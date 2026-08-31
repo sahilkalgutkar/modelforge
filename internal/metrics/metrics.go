@@ -25,6 +25,8 @@ type Metrics struct {
 	shadowDelta       *prometheus.HistogramVec
 
 	driftPSI *prometheus.GaugeVec
+
+	authThrottled prometheus.Counter
 }
 
 // New registers the collectors with r.
@@ -67,6 +69,15 @@ func New(r prometheus.Registerer) *Metrics {
 			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1},
 		}, []string{"model"}),
 
+		authThrottled: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "modelforge_auth_throttled_total",
+			Help: "Clients newly throttled for repeated authentication failures.",
+			// Counted per client newly throttled rather than per rejected
+			// request: the request count is attacker-controlled and would make
+			// the series say more about how hard somebody is trying than about
+			// how many distinct sources are failing.
+		}),
+
 		driftPSI: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "modelforge_feature_psi",
 			Help: "Population Stability Index per feature over the current window.",
@@ -74,7 +85,7 @@ func New(r prometheus.Registerer) *Metrics {
 	}
 
 	r.MustRegister(m.predictions, m.latency, m.errors, m.batchSize,
-		m.shadowComparisons, m.shadowDelta, m.driftPSI)
+		m.shadowComparisons, m.shadowDelta, m.driftPSI, m.authThrottled)
 	return m
 }
 
@@ -108,6 +119,16 @@ func (m *Metrics) ObserveShadow(o routing.ShadowOutcome) {
 		m.shadowDelta.WithLabelValues(o.Model).Observe(o.MaxDelta)
 	}
 }
+
+// ObserveAuthThrottled records that a client was throttled for repeated
+// authentication failures.
+//
+// The client's address is deliberately not a label. It is attacker-controlled
+// and unbounded, so using it would let anybody create as many time series as
+// they liked — a cardinality explosion that takes the monitoring down, which is
+// a worse outcome than the failed logins it was meant to describe. The address
+// is in the log line, where a high-cardinality value belongs.
+func (m *Metrics) ObserveAuthThrottled() { m.authThrottled.Inc() }
 
 // ObserveDrift publishes a drift report as gauges.
 func (m *Metrics) ObserveDrift(rep drift.Report) {
