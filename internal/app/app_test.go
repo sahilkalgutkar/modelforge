@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -716,5 +717,316 @@ func TestThrottlingIsAbsentWhenAuthIsDisabled(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("= %d with auth disabled, want 200", resp.StatusCode)
 		}
+	}
+}
+
+// --- token rotation ---
+
+func tokenFile(t *testing.T, lines ...string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "tokens")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func rewrite(t *testing.T, path string, lines ...string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// probe returns the status of a request made with the given token.
+func probe(t *testing.T, url, token string) int {
+	t.Helper()
+	req, err := http.NewRequest("GET", url+"/v1/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck
+	return resp.StatusCode
+}
+
+// TestRotateTokensWithoutRestarting is the feature end to end: rewrite the
+// file, reload, and a running server accepts the new credential and stops
+// accepting the old one — with an overlap in between so nothing breaks while
+// clients are being moved.
+func TestRotateTokensWithoutRestarting(t *testing.T) {
+	const oldTok, newTok = "rotation-old-token", "rotation-new-token"
+
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.Tokens = nil
+	cfg.TokenFile = tokenFile(t, "ci:admin:"+auth.Digest(oldTok))
+
+	a, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	if got := probe(t, ts.URL, oldTok); got != http.StatusOK {
+		t.Fatalf("the original token = %d, want 200", got)
+	}
+
+	// Overlap: both credentials valid while clients are updated.
+	rewrite(t, cfg.TokenFile,
+		"ci:admin:"+auth.Digest(oldTok),
+		"ci-next:admin:"+auth.Digest(newTok))
+	if err := a.ReloadTokens(); err != nil {
+		t.Fatalf("ReloadTokens: %v", err)
+	}
+	if got := probe(t, ts.URL, oldTok); got != http.StatusOK {
+		t.Errorf("the old token = %d during the overlap, want 200", got)
+	}
+	if got := probe(t, ts.URL, newTok); got != http.StatusOK {
+		t.Errorf("the new token = %d during the overlap, want 200", got)
+	}
+
+	// Withdraw the old one.
+	rewrite(t, cfg.TokenFile, "ci-next:admin:"+auth.Digest(newTok))
+	if err := a.ReloadTokens(); err != nil {
+		t.Fatal(err)
+	}
+	if got := probe(t, ts.URL, oldTok); got != http.StatusUnauthorized {
+		t.Errorf("the withdrawn token = %d, want 401", got)
+	}
+	if got := probe(t, ts.URL, newTok); got != http.StatusOK {
+		t.Errorf("the new token = %d after the rotation, want 200", got)
+	}
+	// The process was never restarted.
+	if got := probe(t, ts.URL, newTok); got != http.StatusOK {
+		t.Errorf("the server stopped serving after rotation: %d", got)
+	}
+}
+
+// TestABadRotationDoesNotTakeTheServerDown is the property that makes rotating
+// in production safe to attempt at all.
+func TestABadRotationDoesNotTakeTheServerDown(t *testing.T) {
+	const tok = "survives-a-bad-rotation"
+
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.Tokens = nil
+	cfg.TokenFile = tokenFile(t, "ci:admin:"+auth.Digest(tok))
+
+	a, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	for _, bad := range [][]string{
+		{"this is not a token entry"},
+		{"ci:admin:too-short"},
+		{"# the whole file got commented out"},
+		{"ci:wizard:" + auth.Digest(tok)},
+	} {
+		rewrite(t, cfg.TokenFile, bad...)
+		if err := a.ReloadTokens(); err == nil {
+			t.Errorf("a reload of %q was accepted", bad)
+		}
+		if got := probe(t, ts.URL, tok); got != http.StatusOK {
+			t.Fatalf("a failed reload broke the running server: %d", got)
+		}
+	}
+
+	// Deleting the file outright — what an in-place secret swap looks like for
+	// a moment — must be survivable too.
+	if err := os.Remove(cfg.TokenFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ReloadTokens(); err == nil {
+		t.Error("reloading a deleted file was accepted")
+	}
+	if got := probe(t, ts.URL, tok); got != http.StatusOK {
+		t.Fatalf("a deleted token file broke the running server: %d", got)
+	}
+}
+
+// TestSIGHUPRotatesTokens covers the signal path against a real listener, since
+// that is the piece a unit test on the Authenticator cannot reach.
+func TestSIGHUPRotatesTokens(t *testing.T) {
+	const oldTok, newTok = "sighup-old", "sighup-new"
+
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.Tokens = nil
+	cfg.TokenFile = tokenFile(t, "ci:admin:"+auth.Digest(oldTok))
+	cfg.Addr = freePort(t)
+	// Polling off, so a pass can only be the signal.
+	cfg.TokenReloadInterval = -1
+
+	a, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	base := "http://" + cfg.Addr
+	waitForServer(t, base)
+
+	if got := probe(t, base, oldTok); got != http.StatusOK {
+		t.Fatalf("the original token = %d, want 200", got)
+	}
+	if got := probe(t, base, newTok); got != http.StatusUnauthorized {
+		t.Fatalf("the new token works before rotation: %d", got)
+	}
+
+	rewrite(t, cfg.TokenFile, "ci-next:admin:"+auth.Digest(newTok))
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if probe(t, base, newTok) == http.StatusOK {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := probe(t, base, newTok); got != http.StatusOK {
+		t.Fatalf("the new token = %d after SIGHUP, want 200", got)
+	}
+	if got := probe(t, base, oldTok); got != http.StatusUnauthorized {
+		t.Errorf("the old token still works after SIGHUP: %d", got)
+	}
+}
+
+// TestPollingPicksUpAnInPlaceRewrite is the Kubernetes case: nothing signals
+// the process, the file just changes underneath it.
+func TestPollingPicksUpAnInPlaceRewrite(t *testing.T) {
+	const oldTok, newTok = "poll-old", "poll-new"
+
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.Tokens = nil
+	cfg.TokenFile = tokenFile(t, "ci:admin:"+auth.Digest(oldTok))
+	cfg.Addr = freePort(t)
+	cfg.TokenReloadInterval = 100 * time.Millisecond
+
+	a, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	base := "http://" + cfg.Addr
+	waitForServer(t, base)
+
+	rewrite(t, cfg.TokenFile, "ci-next:admin:"+auth.Digest(newTok))
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if probe(t, base, newTok) == http.StatusOK {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("the poller never picked up the rewritten token file")
+}
+
+func waitForServer(t *testing.T, base string) {
+	t.Helper()
+	for range 200 {
+		resp, err := http.Get(base + "/healthz")
+		if err == nil {
+			resp.Body.Close()
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("server never started listening")
+}
+
+// TestTokensAndTokenFileTogetherIsRejected: two sources make a reload
+// ambiguous, since re-reading the file cannot see the environment.
+func TestTokensAndTokenFileTogetherIsRejected(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.TokenFile = tokenFile(t, "ci:admin:"+auth.Digest("x"))
+
+	a, err := New(context.Background(), cfg)
+	if err == nil {
+		a.Close()
+		t.Fatal("New accepted both -tokens and -token-file")
+	}
+	if !strings.Contains(err.Error(), "not both") {
+		t.Errorf("error should say to pick one: %v", err)
+	}
+}
+
+func TestReloadWithoutATokenFileIsAnError(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+
+	a, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	if err := a.ReloadTokens(); err == nil {
+		t.Error("ReloadTokens succeeded with no token file configured")
+	}
+}
+
+// TestExpiredTokenStopsWorkingWithoutAReload covers the deadline through the
+// full stack: no rotation, no signal, the credential simply stops.
+func TestExpiredTokenStopsWorkingWithoutAReload(t *testing.T) {
+	const tok = "expiring-token"
+
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.Tokens = nil
+	// A deadline that has already passed, so no waiting is needed to observe
+	// the behaviour.
+	past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	cfg.TokenFile = tokenFile(t,
+		"live:admin:"+auth.Digest("still-good"),
+		"stale:admin:"+auth.Digest(tok)+":"+past)
+
+	a, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	if got := probe(t, ts.URL, tok); got != http.StatusUnauthorized {
+		t.Errorf("an expired token = %d, want 401", got)
+	}
+	if got := probe(t, ts.URL, "still-good"); got != http.StatusOK {
+		t.Errorf("an unexpired token = %d, want 200", got)
 	}
 }

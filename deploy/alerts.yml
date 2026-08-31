@@ -44,6 +44,17 @@ groups:
           summary: "{{ $value | printf \"%.0f\" }} clients throttled for repeated authentication failures"
           description: "Check the logs for the addresses; a single one is usually a misconfigured client, several is worth investigating."
 
+      # A failed reload is invisible from the outside: the server keeps serving
+      # on the previous token set, so nothing looks broken and the rotation
+      # silently did not happen. This counter moving is the only signal.
+      - alert: TokenReloadFailing
+        expr: increase(modelforge_auth_reloads_total{outcome="failed"}[10m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "token reloads are failing; the server is still on its previous token set"
+          description: "A rotation is not taking effect. Check the token file parses — the server logs the reason and keeps the old credentials working."
+
       # A batch mean near 1 means requests are arriving too slowly to group, so
       # the batching window is pure added latency and should be lowered.
       - alert: BatchingIneffective
