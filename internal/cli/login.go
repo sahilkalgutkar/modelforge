@@ -10,9 +10,8 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
+	"net/url"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -87,7 +86,11 @@ func (c *Client) Login(ctx context.Context, openBrowser func(string) error) erro
 		ClientID:    meta.ClientID,
 		Endpoint:    endpoint,
 		RedirectURL: redirectURL,
-		Scopes:      []string{oidc.ScopeOpenID, "profile", "email", "groups"},
+		// offline_access is what asks for a refresh token. Providers that do
+		// not implement it ignore the scope, which is why this does not fail
+		// when none comes back — the session simply behaves as it did before
+		// and expires.
+		Scopes: []string{oidc.ScopeOpenID, "profile", "email", "groups", "offline_access"},
 	}
 
 	// state defends the callback against a forged request; nonce binds the
@@ -180,7 +183,14 @@ func (c *Client) Login(ctx context.Context, openBrowser func(string) error) erro
 		return errors.New("the returned token does not match this login attempt")
 	}
 
-	if err := SaveCredential(rawID); err != nil {
+	cred := Credential{
+		IDToken:      rawID,
+		RefreshToken: token.RefreshToken,
+		Expiry:       idToken.Expiry,
+		Issuer:       meta.Issuer,
+		ClientID:     meta.ClientID,
+	}
+	if err := SaveCredential(cred); err != nil {
 		return err
 	}
 
@@ -193,8 +203,12 @@ func (c *Client) Login(ctx context.Context, openBrowser func(string) error) erro
 		return nil
 	}
 	fmt.Fprintf(c.Out, "signed in as %s (%s)\n", who.Name, strings.Join(scopeNames(who.Scopes), ", "))
-	if who.Expires != "" {
-		fmt.Fprintf(c.Out, "this session expires at %s\n", who.Expires)
+	switch {
+	case cred.RefreshToken != "":
+		fmt.Fprintln(c.Out, "this session renews itself; run `modelforgectl logout` to end it")
+	case who.Expires != "":
+		fmt.Fprintf(c.Out, "this session expires at %s and cannot be renewed "+
+			"(the provider issued no refresh token)\n", who.Expires)
 	}
 	return nil
 }
@@ -301,74 +315,151 @@ func OpenBrowser(url string) error {
 	return exec.Command(name, args...).Start()
 }
 
-// --- credential storage ---
+// Refresh renews a stored login using its refresh token.
+//
+// It is the whole reason a refresh token is worth its risk: without one, an
+// expiring session means signing in again in the middle of whatever you were
+// doing, which in practice means people reach for a long-lived static token
+// instead — trading an hour-long credential for a permanent one.
+//
+// A provider that rotates refresh tokens returns a new one, and it is stored.
+// Missing that would work perfectly until the old token was invalidated and
+// then fail with no obvious cause, so the new value is taken whenever one is
+// offered and the previous one kept when it is not.
+func (c *Client) Refresh(ctx context.Context, cred Credential) (Credential, error) {
+	if !cred.CanRefresh() {
+		return cred, errors.New("this login cannot be renewed; sign in again")
+	}
 
-// CredentialPath is where a login is stored.
-func CredentialPath() (string, error) {
-	if p := os.Getenv("MODELFORGE_CREDENTIAL_FILE"); p != "" {
-		return p, nil
-	}
-	dir, err := os.UserConfigDir()
+	provider, err := oidc.NewProvider(ctx, cred.Issuer)
 	if err != nil {
-		return "", fmt.Errorf("locate a config directory: %w", err)
+		return cred, fmt.Errorf("reach the identity provider at %s: %w", cred.Issuer, err)
 	}
-	return filepath.Join(dir, "modelforge", "credential"), nil
+	endpoint := provider.Endpoint()
+	endpoint.AuthStyle = oauth2.AuthStyleInParams
+
+	conf := &oauth2.Config{ClientID: cred.ClientID, Endpoint: endpoint}
+	token, err := conf.TokenSource(ctx, &oauth2.Token{RefreshToken: cred.RefreshToken}).Token()
+	if err != nil {
+		// The usual causes are a refresh token that expired, one that was
+		// revoked, and a session an administrator ended. None of them are
+		// fixable by retrying, so this says to sign in rather than looking
+		// like a transient failure.
+		return cred, fmt.Errorf("could not renew this session (%w); run `modelforgectl login` again", err)
+	}
+
+	rawID, _ := token.Extra("id_token").(string)
+	if rawID == "" {
+		// Some providers only return an id_token on the initial exchange. That
+		// leaves nothing this server can authenticate with, so it is a failure
+		// rather than a partial success.
+		return cred, errors.New("the provider renewed the session but returned no id_token; sign in again")
+	}
+	if _, err := provider.Verifier(&oidc.Config{SkipClientIDCheck: true}).Verify(ctx, rawID); err != nil {
+		return cred, fmt.Errorf("the renewed token did not verify: %w", err)
+	}
+
+	next := cred
+	next.IDToken = rawID
+	next.Expiry = token.Expiry
+	if token.RefreshToken != "" {
+		next.RefreshToken = token.RefreshToken
+	}
+	return next, nil
 }
 
-// SaveCredential writes a token to the credential file.
+// EnsureFresh renews the stored credential if it is about to expire, and
+// returns the token to use.
 //
-// The directory and the file are both created 0700/0600 and the mode is set
-// explicitly rather than left to the umask, because a umask of 022 would leave
-// a readable credential in a home directory that other accounts on the machine
-// can list.
-func SaveCredential(token string) error {
-	path, err := CredentialPath()
+// The refresh happens under a file lock and re-reads the credential inside it,
+// so a process that blocked waiting for the lock uses whatever the winner just
+// wrote rather than refreshing again with a token that has since been rotated
+// away.
+func (c *Client) EnsureFresh(ctx context.Context) error {
+	cred := LoadCredential()
+	if !cred.Valid() || !cred.Stale(time.Now()) || !cred.CanRefresh() {
+		return nil
+	}
+
+	return withCredentialLock(func() error {
+		cred := LoadCredential()
+		if !cred.Valid() || !cred.Stale(time.Now()) {
+			// Somebody else refreshed while this process waited for the lock.
+			if cred.Valid() {
+				c.Token = cred.IDToken
+			}
+			return nil
+		}
+
+		next, err := c.Refresh(ctx, cred)
+		if err != nil {
+			return err
+		}
+		if err := SaveCredential(next); err != nil {
+			return err
+		}
+		c.Token = next.IDToken
+		return nil
+	})
+}
+
+// revoke asks the provider to invalidate a token, if it supports RFC 7009.
+//
+// Deleting the local file was never revocation — the token stayed valid at the
+// provider until it expired, and a refresh token can be good for weeks. Adding
+// a longer-lived secret without also adding a way to withdraw it would be the
+// wrong trade, so logout now tries this first.
+//
+// A provider with no revocation endpoint is reported rather than glossed,
+// because "logged out" meaning two different things depending on the provider
+// is exactly the sort of ambiguity that gets somebody in trouble.
+func revoke(ctx context.Context, issuer, clientID, token string) error {
+	var meta struct {
+		RevocationEndpoint string `json:"revocation_endpoint"`
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET",
+		strings.TrimRight(issuer, "/")+"/.well-known/openid-configuration", nil)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create the credential directory: %w", err)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("reach the identity provider: %w", err)
 	}
-	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
-		return fmt.Errorf("write the credential: %w", err)
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		return fmt.Errorf("read the provider metadata: %w", err)
 	}
-	// MkdirAll leaves an existing directory's mode alone, so a directory that
-	// predates this — or was created by something with a laxer umask — is
-	// tightened here rather than assumed.
-	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("secure the credential directory: %w", err)
+	if meta.RevocationEndpoint == "" {
+		return errNoRevocationEndpoint
 	}
-	return os.Chmod(path, 0o600)
+
+	form := url.Values{"token": {token}, "client_id": {clientID}}
+	rreq, err := http.NewRequestWithContext(ctx, "POST", meta.RevocationEndpoint,
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	rreq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	rresp, err := http.DefaultClient.Do(rreq)
+	if err != nil {
+		return fmt.Errorf("call the revocation endpoint: %w", err)
+	}
+	defer rresp.Body.Close()
+	io.Copy(io.Discard, rresp.Body) //nolint:errcheck // draining for connection reuse
+
+	// RFC 7009 says a provider returns 200 for a token it does not recognise,
+	// so anything else is a real failure rather than "already gone".
+	if rresp.StatusCode != http.StatusOK {
+		return fmt.Errorf("the provider returned %d from its revocation endpoint", rresp.StatusCode)
+	}
+	return nil
 }
 
-// LoadCredential reads a stored login, returning "" when there is none.
-func LoadCredential() string {
-	path, err := CredentialPath()
-	if err != nil {
-		return ""
-	}
-	body, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(body))
-}
+var errNoRevocationEndpoint = errors.New("the provider advertises no revocation endpoint")
 
-// DeleteCredential removes a stored login.
-func DeleteCredential() (bool, error) {
-	path, err := CredentialPath()
-	if err != nil {
-		return false, err
-	}
-	if err := os.Remove(path); err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("remove the credential: %w", err)
-	}
-	return true, nil
-}
-
+// --- server metadata ---
 // --- server metadata ---
 
 type authMeta struct {
@@ -443,8 +534,31 @@ func (c *Client) WhoAmI() error {
 	return nil
 }
 
-// Logout removes a stored login.
-func (c *Client) Logout() error {
+// Logout revokes the session at the provider, then removes it locally.
+//
+// Revocation is attempted first and its outcome reported honestly. Deleting the
+// file alone was never logging out — the tokens stayed valid at the provider
+// until they expired, and a refresh token can be good for weeks. A tool that
+// says "logged out" while leaving a working credential in existence is telling
+// somebody they are safe when they are not.
+func (c *Client) Logout(ctx context.Context) error {
+	cred := LoadCredential()
+
+	if cred.CanRefresh() {
+		// The refresh token is the one that matters: revoking it ends the
+		// session, while the ID token expires on its own within the hour.
+		switch err := revoke(ctx, cred.Issuer, cred.ClientID, cred.RefreshToken); {
+		case err == nil:
+			fmt.Fprintln(c.Out, "revoked this session at the identity provider")
+		case errors.Is(err, errNoRevocationEndpoint):
+			fmt.Fprintln(c.Out, "the identity provider advertises no revocation endpoint, so the session "+
+				"could not be ended remotely; it stays valid until it expires")
+		default:
+			fmt.Fprintf(c.Out, "could not revoke at the identity provider: %v\n", err)
+			fmt.Fprintln(c.Out, "the session stays valid until it expires; revoke it there if it may have been exposed")
+		}
+	}
+
 	removed, err := DeleteCredential()
 	if err != nil {
 		return err
@@ -453,10 +567,6 @@ func (c *Client) Logout() error {
 		fmt.Fprintln(c.Out, "no stored login to remove")
 		return nil
 	}
-	// Worth saying plainly: this deletes a local file. The token remains valid
-	// at the provider until it expires, and nothing here can recall it.
 	fmt.Fprintln(c.Out, "removed the stored login from this machine")
-	fmt.Fprintln(c.Out, "the token itself stays valid until it expires; revoke it at your identity provider "+
-		"if it may have been exposed")
 	return nil
 }
