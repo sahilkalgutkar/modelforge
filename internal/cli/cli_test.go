@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/sahilkalgutkar/modelforge/internal/app"
+	"github.com/sahilkalgutkar/modelforge/internal/auth"
 	"github.com/sahilkalgutkar/modelforge/internal/drift"
 	"github.com/sahilkalgutkar/modelforge/internal/registry"
 )
@@ -48,11 +49,19 @@ func serverURL(t *testing.T) string {
 		DatabaseURL: dsn,
 		ArtifactDir: t.TempDir(),
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// A real token rather than AuthDisabled: the CLI is the thing that has
+		// to get the credential onto every request, and a harness that turned
+		// auth off would test everything except that.
+		Tokens: []string{"cli:admin:" + auth.Digest(testToken)},
 	})
 	if err != nil {
 		t.Fatalf("start server: %v", err)
 	}
 	t.Cleanup(a.Close)
+
+	// The CLI reads its credential from the environment, which is the
+	// documented mechanism, so the tests drive it the same way.
+	t.Setenv("MODELFORGE_TOKEN", testToken)
 
 	ts := httptest.NewServer(a.Handler())
 	t.Cleanup(ts.Close)
@@ -66,6 +75,9 @@ func run(t *testing.T, addr string, args ...string) (string, int) {
 	code := Run(args, addr, &buf)
 	return buf.String(), code
 }
+
+// testToken is the credential the CLI suite presents.
+const testToken = "test-token-for-the-cli-suite"
 
 func modelFile() string {
 	return filepath.Join("..", "..", "testdata", "xgboost", "binary_logistic.model.json")
@@ -355,7 +367,13 @@ func TestBaselineAndDriftReadings(t *testing.T) {
 			body["features"][f] = r.NormFloat64() + 4
 		}
 		b, _ := json.Marshal(body)
-		resp, err := client.Post(addr+"/v1/models/monitored/predict", "application/json", bytes.NewReader(b))
+		req, err := http.NewRequest("POST", addr+"/v1/models/monitored/predict", bytes.NewReader(b))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+testToken)
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -458,4 +476,164 @@ func TestPromotingTheShadowClearsIt(t *testing.T) {
 	if !strings.Contains(out, "no longer shadowed") {
 		t.Errorf("the change was not explained to the operator: %s", out)
 	}
+}
+
+// --- authentication ---
+
+// TestMintTokenPrintsTheSecretOnceAndTheDigestToConfigure covers the shape of
+// the output an operator copies from: the token to store somewhere safe, and
+// the entry to paste into the server's configuration.
+func TestMintTokenPrintsTheSecretOnceAndTheDigestToConfigure(t *testing.T) {
+	var buf bytes.Buffer
+	if err := MintToken("ci", "admin", &buf, false); err != nil {
+		t.Fatalf("MintToken: %v", err)
+	}
+	out := buf.String()
+
+	// Pull the token out of the output and check the printed entry really is
+	// its digest — a mismatch here would produce a config that never
+	// authenticates anything, discovered only at deploy time.
+	var token string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.Contains(line, " ") && !strings.Contains(line, ":") {
+			token = line
+			break
+		}
+	}
+	if token == "" {
+		t.Fatalf("could not find the token in the output:\n%s", out)
+	}
+	if !strings.Contains(out, "ci:admin:"+auth.Digest(token)) {
+		t.Errorf("the printed config entry is not this token's digest:\n%s", out)
+	}
+	// The whole point of storing digests is that the secret is unrecoverable,
+	// so the output has to say so rather than let somebody assume otherwise.
+	if !strings.Contains(out, "cannot be recovered") {
+		t.Errorf("output should warn the token cannot be recovered:\n%s", out)
+	}
+}
+
+func TestMintTokenValidatesItsArguments(t *testing.T) {
+	for _, tc := range []struct{ name, tokenName, scopes, want string }{
+		{"unknown scope", "ci", "superuser", "unknown scope"},
+		{"unknown scope among valid", "ci", "read+superuser", "unknown scope"},
+		// The config format is colon-delimited with plus-separated scopes, so a
+		// name carrying either would produce an entry that parses as something
+		// else entirely.
+		{"name with a colon", "ci:prod", "admin", "must not"},
+		{"name with a plus", "ci+prod", "admin", "must not"},
+		{"name with a space", "ci prod", "admin", "must not"},
+		{"empty name", "", "admin", "must not"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			err := MintToken(tc.tokenName, tc.scopes, &buf, false)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("MintToken = %v, want an error containing %q", err, tc.want)
+			}
+		})
+	}
+
+	for _, scopes := range []string{"admin", "read", "predict", "read+predict"} {
+		var buf bytes.Buffer
+		if err := MintToken("ci", scopes, &buf, false); err != nil {
+			t.Errorf("MintToken with scopes %q = %v", scopes, err)
+		}
+	}
+}
+
+func TestTokenCommandThroughRun(t *testing.T) {
+	out, code := run(t, "http://localhost:1", "token", "ci", "admin")
+	if code != 0 || !strings.Contains(out, "ci:admin:") {
+		t.Fatalf("token command: %d %s", code, out)
+	}
+
+	if out, code := run(t, "http://localhost:1", "token", "ci"); code != 1 ||
+		!strings.Contains(out, "needs a name and at least one scope") {
+		t.Errorf("token without a scope: %d %s", code, out)
+	}
+}
+
+// TestAuthFailuresExplainTheFix is why the client inspects the status rather
+// than printing whatever the server said. 401 and 403 have opposite
+// remediations, and an operator should not have to read the server's logs to
+// learn which one they are looking at.
+func TestAuthFailuresExplainTheFix(t *testing.T) {
+	addr := serverURL(t) // configured with an admin token
+
+	// No credential at all.
+	t.Setenv("MODELFORGE_TOKEN", "")
+	out, code := run(t, addr, "models")
+	if code != 1 {
+		t.Fatalf("expected failure without a credential, got %d: %s", code, out)
+	}
+	if !strings.Contains(out, "401") || !strings.Contains(out, "MODELFORGE_TOKEN") {
+		t.Errorf("401 message should point at MODELFORGE_TOKEN: %s", out)
+	}
+	if !strings.Contains(out, "modelforgectl token") {
+		t.Errorf("401 message should say how to mint a token: %s", out)
+	}
+
+	// A credential that is not recognised.
+	t.Setenv("MODELFORGE_TOKEN", "not-a-real-token")
+	out, code = run(t, addr, "models")
+	if code != 1 || !strings.Contains(out, "401") {
+		t.Errorf("unknown token: %d %s", code, out)
+	}
+}
+
+// TestScopeFailureIsReportedAsSuch runs a read-only credential against a write,
+// and checks the client says the token is valid but not permitted rather than
+// implying the credential is wrong.
+func TestScopeFailureIsReportedAsSuch(t *testing.T) {
+	addr := serverWithReadOnlyToken(t)
+
+	t.Setenv("MODELFORGE_TOKEN", readOnlyToken)
+	if out, code := run(t, addr, "models"); code != 0 {
+		t.Fatalf("a read token could not list models: %d %s", code, out)
+	}
+
+	out, code := run(t, addr, "create", "forbidden-model")
+	if code != 1 {
+		t.Fatalf("a read-only token created a model: %d %s", code, out)
+	}
+	if !strings.Contains(out, "403") || !strings.Contains(out, "broader scope") {
+		t.Errorf("403 message should say the token needs a broader scope: %s", out)
+	}
+}
+
+const readOnlyToken = "cli-read-only-token"
+
+func serverWithReadOnlyToken(t *testing.T) string {
+	t.Helper()
+
+	dsn := os.Getenv("MODELFORGE_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Fatal("MODELFORGE_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	reg, err := registry.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reg.Close()
+
+	a, err := app.New(ctx, app.Config{
+		DatabaseURL: dsn,
+		ArtifactDir: t.TempDir(),
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Tokens:      []string{"dash:read:" + auth.Digest(readOnlyToken)},
+	})
+	if err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	t.Cleanup(a.Close)
+
+	ts := httptest.NewServer(a.Handler())
+	t.Cleanup(ts.Close)
+	return ts.URL
 }

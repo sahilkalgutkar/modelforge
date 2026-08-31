@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,7 +23,18 @@ func main() {
 	flag.StringVar(&cfg.ArtifactDir, "artifact-dir", envOr("MODELFORGE_ARTIFACT_DIR", "./var/artifacts"), "directory for model artifacts")
 	flag.DurationVar(&cfg.ShadowTimeout, "shadow-timeout", 2*time.Second, "how long a shadow request may run")
 	flag.DurationVar(&cfg.DriftInterval, "drift-interval", 30*time.Second, "how often drift readings refresh")
+	tokens := flag.String("tokens", os.Getenv("MODELFORGE_TOKENS"),
+		"comma-separated API tokens as name:scopes:sha256hex (mint with `modelforgectl token`)")
+	authDisabled := flag.Bool("auth-disabled", os.Getenv("MODELFORGE_AUTH_DISABLED") == "true",
+		"serve with no authentication at all")
 	flag.Parse()
+
+	cfg.AuthDisabled = *authDisabled
+	for _, t := range strings.Split(*tokens, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			cfg.Tokens = append(cfg.Tokens, t)
+		}
+	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg.Logger = logger

@@ -7,6 +7,17 @@ rule_files:
 
 scrape_configs:
   - job_name: modelforge
+    # /metrics requires the read scope, because it carries every model name,
+    # version, request volume and drift reading — together a description of
+    # what is being scored and how much of it. Prometheus sending a bearer
+    # token is two lines, which is a cheap price for that.
+    #
+    # Mint one with `modelforgectl token prometheus read`, put the token in
+    # deploy/prometheus-token (gitignored), and add its digest to the server's
+    # MODELFORGE_TOKENS. `make up` creates a development token automatically.
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/token
     static_configs:
       # host.docker.internal reaches a server run with `make run` on the host.
       # Running the server in the compose file instead would mean rebuilding

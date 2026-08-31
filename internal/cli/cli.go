@@ -13,12 +13,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/sahilkalgutkar/modelforge/internal/auth"
 	"github.com/sahilkalgutkar/modelforge/internal/routing"
 )
 
@@ -27,12 +29,16 @@ type Client struct {
 	BaseURL string
 	HTTP    *http.Client
 	Out     io.Writer
+	// Token is sent as a bearer credential. Empty means send nothing, which is
+	// what talking to a server started with -auth-disabled looks like.
+	Token string
 }
 
 // NewClient creates a Client with sensible defaults.
 func NewClient(baseURL string, out io.Writer) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
+		Token:   os.Getenv("MODELFORGE_TOKEN"),
 		// The timeout is generous because pushing a model uploads its
 		// artifact, which is the slowest thing this client does by far.
 		HTTP: &http.Client{Timeout: 2 * time.Minute},
@@ -60,9 +66,16 @@ Commands:
   baseline <model> <version> <file.json>  attach training distributions for drift
   drift <model> <version>                 show drift readings
   stats <model> <version>                 show batching and health counters
+  token <name> <scope>[+<scope>] [--env]  mint an API token and print its config entry
 
 Flags:
   -addr URL   server address (default http://localhost:8080, or MODELFORGE_ADDR)
+
+Environment:
+  MODELFORGE_TOKEN   bearer token sent with every request
+
+Scopes: predict (call the serving endpoint), read (inspect models, policies,
+drift and metrics), admin (everything, including changing what serves traffic).
 `
 
 // Run executes one command and returns a process exit code.
@@ -139,6 +152,13 @@ func Run(args []string, addr string, out io.Writer) int {
 		if v, err = versionArg(args, "stats"); err == nil {
 			err = c.ShowStats(args[1], v)
 		}
+	case "token":
+		if len(args) < 3 {
+			err = fmt.Errorf("token needs a name and at least one scope")
+			break
+		}
+		envOnly := len(args) > 3 && args[3] == "--env"
+		err = MintToken(args[1], args[2], out, envOnly)
 	default:
 		fmt.Fprintf(out, "unknown command %q\n\n%s", args[0], Usage)
 		return 2
@@ -320,7 +340,14 @@ func (c *Client) Push(model, path string, features []string) error {
 
 	// The file is streamed rather than read into memory: a model artifact can
 	// be hundreds of megabytes and this is a CLI people run on laptops.
-	resp, err := c.HTTP.Post(url, "application/octet-stream", f)
+	req, err := http.NewRequest("POST", url, f)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	c.authorize(req)
+
+	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err
 	}
@@ -400,6 +427,7 @@ func (c *Client) PushBaseline(model string, version int, path string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.authorize(req)
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -503,6 +531,48 @@ func (c *Client) ShowStats(model string, version int) error {
 	return nil
 }
 
+// MintToken generates a token and prints it alongside the entry to configure.
+//
+// The token is shown once and never stored: the server only ever holds its
+// digest, so there is nowhere to look it up later. That is the point — a
+// credential store that can show you the secret again is a credential store
+// that can leak it — but it does mean losing one means minting a replacement,
+// so the output says so rather than letting somebody discover it.
+// The --env form exists so that scripts and the Makefile can consume the
+// result without parsing prose. Machine output and human output being the same
+// text is how a tidy-up to the wording silently breaks somebody's setup script.
+func MintToken(name, scopes string, out io.Writer, envOnly bool) error {
+	for _, s := range strings.Split(scopes, "+") {
+		if !slices.Contains(auth.AllScopes, auth.Scope(strings.TrimSpace(s))) {
+			return fmt.Errorf("unknown scope %q", s)
+		}
+	}
+	if strings.ContainsAny(name, ":+ ") || name == "" {
+		// The config format is colon-delimited with plus-separated scopes, so a
+		// name carrying either would produce an entry that parses as something
+		// else entirely.
+		return fmt.Errorf("token name %q must not be empty or contain ':', '+' or spaces", name)
+	}
+
+	token, err := auth.GenerateToken()
+	if err != nil {
+		return err
+	}
+
+	if envOnly {
+		fmt.Fprintf(out, "MODELFORGE_TOKEN=%s\n", token)
+		fmt.Fprintf(out, "MODELFORGE_TOKENS_ENTRY=%s:%s:%s\n", name, scopes, auth.Digest(token))
+		return nil
+	}
+
+	fmt.Fprintf(out, "token (shown once, store it now):\n\n  %s\n\n", token)
+	fmt.Fprintf(out, "add this to the server's MODELFORGE_TOKENS:\n\n  %s:%s:%s\n\n",
+		name, scopes, auth.Digest(token))
+	fmt.Fprintf(out, "the server stores only the digest, so this token cannot be recovered — "+
+		"mint a new one if it is lost.\n")
+	return nil
+}
+
 // --- transport ---
 
 func (c *Client) get(path string, out any) error        { return c.do("GET", path, nil, out) }
@@ -525,6 +595,7 @@ func (c *Client) do(method, path string, body, out any) error {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	c.authorize(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err
@@ -547,14 +618,33 @@ func (c *Client) do(method, path string, body, out any) error {
 // serverError turns an error response into something readable. The server
 // sends {"error": "..."}, and printing that message beats printing a status
 // code the operator then has to go and look up.
+// authorize attaches the bearer credential, if one is configured.
+func (c *Client) authorize(req *http.Request) {
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+}
+
 func serverError(status int, raw []byte) error {
 	var e struct {
 		Error string `json:"error"`
 	}
+	msg := strings.TrimSpace(string(raw))
 	if json.Unmarshal(raw, &e) == nil && e.Error != "" {
-		return fmt.Errorf("server returned %d: %s", status, e.Error)
+		msg = e.Error
 	}
-	return fmt.Errorf("server returned %d: %s", status, strings.TrimSpace(string(raw)))
+
+	// 401 and 403 have different fixes, and saying which is which here saves
+	// the operator from reading the server's logs to find out.
+	switch status {
+	case http.StatusUnauthorized:
+		return fmt.Errorf("server returned 401: %s — set MODELFORGE_TOKEN to a valid token "+
+			"(mint one with `modelforgectl token <name> <scope>`)", msg)
+	case http.StatusForbidden:
+		return fmt.Errorf("server returned 403: %s — the token is valid but not permitted; "+
+			"it needs a broader scope", msg)
+	}
+	return fmt.Errorf("server returned %d: %s", status, msg)
 }
 
 func humanBytes(n int64) string {

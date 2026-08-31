@@ -125,7 +125,14 @@ to regenerate fixtures.
 
 ```bash
 make db        # Postgres on :5432, plus the test database
-make run       # server on :8080
+make run       # mints development tokens, then serves on :8080
+```
+
+`make run` writes `deploy/dev-tokens.env` on first use, holding an admin token
+for the CLI and a read token for Prometheus. Source it before using the client:
+
+```bash
+source deploy/dev-tokens.env
 ```
 
 Train something and deploy it:
@@ -143,8 +150,9 @@ PY
 ./bin/modelforgectl deploy fraud-score 1
 
 curl -s localhost:8080/v1/models/fraud-score/predict \
+  -H "Authorization: Bearer $MODELFORGE_TOKEN" \
   -d '{"features":{"amount":1.2,"age":-0.3,"tenure":0.8,"disputes":-1.1},"key":"user-42"}'
-# {"model":"fraud-score","version":1,"prediction":[0.87...]}
+# {"model":"fraud-score","version":1,"prediction":[0.9976470962194207]}
 ```
 
 Roll a second version out gradually, watch it, then commit or revert:
@@ -199,6 +207,118 @@ training samples per feature, not pre-computed bins. The binning rules
 (quantile edges, tie collapsing, the empty-bin correction) are the server's, and
 a client computing its own would silently disagree with the next server version.
 
+## Authentication
+
+Every route except the health probes needs a bearer token, and the server holds
+only SHA-256 **digests** of those tokens — never the tokens themselves — so a
+leaked config file or a leaked environment does not hand anybody a working
+credential.
+
+```bash
+modelforgectl token ci admin
+# token (shown once, store it now):
+#
+#   <43 characters of base64url>
+#
+# add this to the server's MODELFORGE_TOKENS:
+#
+#   ci:admin:<64 hex characters>
+```
+
+The values above are elided on purpose. A README that printed a real token
+beside its real digest would be publishing a working admin credential, and
+anybody who pasted that digest into their own `MODELFORGE_TOKENS` would be
+trusting a secret that is on GitHub.
+
+**Plain SHA-256, not bcrypt or argon2**, and that is deliberate rather than an
+oversight. Password hashes are slow on purpose, to make brute force expensive
+over the small guessable space human-chosen passwords occupy. These tokens are
+256 bits of cryptographic randomness: there is no space to brute force, so a
+slow hash would buy nothing and would put its cost on every single request. The
+threat a password hash defends against does not exist here.
+
+The comparison is timing-safe because the caller's guess is hashed *before* the
+lookup. The attack a constant-time compare exists to stop is an early-exit
+byte-by-byte comparison against a secret, which leaks how many leading bytes
+were right. Hashing first means flipping one bit of a guess changes every bit of
+the key, so a near miss and a wild miss are indistinguishable — there is no "how
+close was I" signal to measure. Adding a constant-time compare after that lookup
+would compare a value against itself and prove nothing.
+
+### Three scopes
+
+| Scope | Can do |
+| --- | --- |
+| `predict` | call the serving endpoint, nothing else |
+| `read` | inspect models, versions, policies, drift, stats, `/metrics` |
+| `admin` | everything, including changing what serves traffic |
+
+`admin` implies the other two; `read` and `predict` imply nothing. The split is
+what lets the credential shipped to a high-volume caller score and *only* score,
+so leaking it does not also expose which models exist and how they are deployed
+— and lets a dashboard read everything without being able to change what serves.
+
+A whole-table test asserts, for every route, which of the three tokens gets in
+and which gets a 403. Writing it as one table rather than scattered assertions
+is what makes a route added later without a scope show up as a missing row.
+
+### 401 and 403 mean different things
+
+A missing or unrecognised token is **401** with a `WWW-Authenticate` challenge:
+the caller has not proved who they are, and retrying with a credential is the
+fix. A valid token without the scope is **403**: they have proved who they are
+and the answer is still no, so retrying is pointless and somebody has to grant
+the scope. Collapsing both into one status sends operators hunting a permissions
+problem when the real one is an unset environment variable. The CLI says which
+is which rather than making you read the server's logs.
+
+### It fails closed
+
+Starting with no tokens and no explicit opt-out is **refused**, not defaulted to
+open:
+
+```
+modelforge: no API tokens configured. Mint one with `modelforgectl token <name> <scope>`
+and set MODELFORGE_TOKENS, or pass -auth-disabled to run without authentication deliberately
+```
+
+Getting this wrong is silent in the worst way — the server comes up, serves, and
+looks entirely healthy while its control plane is open to anyone who can reach
+the port. No log line anybody actually reads beats simply not starting.
+`-auth-disabled` exists because local development and the test suite genuinely
+do not want tokens, and a flag somebody had to type is very different from a
+default nobody chose. Setting both is rejected rather than resolved, because
+guessing which half of a contradictory security configuration was meant is
+exactly the wrong instinct.
+
+### What is deliberately left open
+
+`/healthz` and `/readyz` need no credential. A liveness probe that needs one
+starts failing the moment a token is rotated or misconfigured, and would then
+restart the very process that is serving correctly — and neither endpoint
+reveals more than whether the process is up and how many models it holds.
+
+`/metrics` **is** protected, by `read`. It is not neutral: it carries every
+model name, version, request volume and drift reading, which together describe
+what is being scored and how much of it. Prometheus sends a bearer token from
+its scrape config, so the cost of protecting it is two lines of configuration.
+
+### Audit
+
+Control-plane changes are logged with the name of the credential that made them:
+
+```
+{"msg":"authorised change","token":"dev","method":"PUT","path":"/v1/models/fraud-score/policy"}
+```
+
+Never the token itself — only its name, which is why the `Token` struct carries
+no secret to leak in the first place. The condition is the `admin` scope rather
+than simply a writing HTTP method, and that distinction was a bug I shipped and
+caught in the smoke run: scoring is a `POST`, so keying on the method logged a
+line per prediction. At serving volume that is millions of audit entries a day
+burying the handful that record an actual change. Twenty predictions now produce
+zero audit lines; one policy change produces one.
+
 ## Observability
 
 ```bash
@@ -233,7 +353,7 @@ and a fake agrees with whatever the code happens to do.
 same database and truncate it between cases, so running packages concurrently
 has them resetting the database underneath each other.
 
-Coverage is **90.5%** of `internal/`, measured with `-coverpkg` so that code is
+Coverage is **91.2%** of `internal/`, measured with `-coverpkg` so that code is
 attributed to the package that owns it rather than the package running the test
 — without it the end-to-end suites, which exercise serving and routing through
 HTTP, would report those packages as untested.
@@ -251,6 +371,9 @@ fail silently:
 | `TestGuardWillNotEmptyTheSplit` | an automatic rollback becoming an outage |
 | `TestPoliciesSurviveARestart` | a restart quietly serving 404s |
 | `TestOneCallerCancellingDoesNotCancelTheBatch` | one client's timeout failing its batch mates |
+| `TestEveryRouteEnforcesItsScope` | a route shipped without a scope |
+| `TestStartupFailsClosedWithoutTokens` | a server serving its control plane to anyone |
+| `TestOnlyControlPlaneChangesAreAudited` | an audit log drowned in one line per prediction |
 
 ## Known limitations
 
@@ -270,9 +393,14 @@ I would rather write these down than let someone discover them.
 - **The rollout guard reacts to errors, not to quality.** It catches a version
   that is throwing, not one that is quietly predicting badly — that needs
   labels, which arrive long after the request.
-- **The admin API has no authentication.** It is scoped as a component that
-  would sit behind a gateway, and shipping a half-considered auth scheme seemed
-  worse than being explicit that there is none.
+- **Tokens are static, and there is no revocation list.** Rotating one means
+  editing the server's configuration and restarting, which is fine for a handful
+  of long-lived credentials and wrong for per-user tokens. Short-lived
+  credentials would want OIDC and a JWKS endpoint, which is a different design.
+- **There is no rate limiting on failed authentication.** A wrong token is
+  rejected in constant work, but nothing slows down an attacker trying many —
+  that belongs at the gateway, and pretending otherwise here would be security
+  theatre.
 
 ## Layout
 
@@ -285,6 +413,7 @@ I would rather write these down than let someone discover them.
 | `internal/routing` | canary splits, shadow mirroring, the rollout guard |
 | `internal/drift` | PSI baselines and the sliding-window monitor |
 | `internal/serving` | loaded versions, schema binding, the data plane |
+| `internal/auth` | bearer tokens, scopes, the audit middleware |
 | `internal/api` | HTTP surface |
 | `internal/app` | wiring, startup restore, shutdown ordering |
 | `internal/cli` | `modelforgectl` |

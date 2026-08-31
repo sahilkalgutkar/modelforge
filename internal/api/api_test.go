@@ -11,11 +11,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/sahilkalgutkar/modelforge/internal/artifact"
+	"github.com/sahilkalgutkar/modelforge/internal/auth"
 	"github.com/sahilkalgutkar/modelforge/internal/registry"
 	"github.com/sahilkalgutkar/modelforge/internal/routing"
 	"github.com/sahilkalgutkar/modelforge/internal/runtime/xgboost"
@@ -631,5 +633,288 @@ func TestConcurrentPredictionsAreConsistent(t *testing.T) {
 		stats.Rows, stats.Batches, stats.Mean(), stats.LargestBatch)
 	if stats.LargestBatch < 2 {
 		t.Errorf("largest batch was %d; concurrent requests were not batched", stats.LargestBatch)
+	}
+}
+
+// --- authentication ---
+
+// Tokens the auth harness issues, one per scope, so a test can prove that a
+// credential is refused for exactly the routes it should be.
+const (
+	adminToken   = "harness-admin-token"
+	readToken    = "harness-read-token"
+	predictToken = "harness-predict-token"
+)
+
+// newAuthedHarness is newHarness with real authentication rather than the
+// disabled Authenticator the other tests use.
+func newAuthedHarness(t *testing.T) *harness {
+	t.Helper()
+	h := newHarness(t)
+
+	authn, err := auth.New([]string{
+		"admin:admin:" + auth.Digest(adminToken),
+		"dash:read:" + auth.Digest(readToken),
+		"edge:predict:" + auth.Digest(predictToken),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rebuild the server with auth on, against the same dependencies.
+	h.server = NewServer(Deps{
+		Registry: h.reg, Manager: h.manager, Router: h.router, Auth: authn,
+	})
+	h.http.Close()
+	h.http = httptest.NewServer(h.server.Handler())
+	t.Cleanup(h.http.Close)
+	return h
+}
+
+// call issues a request with an optional bearer token and returns the status.
+func (h *harness) call(t *testing.T, method, path, token string, body any) int {
+	t.Helper()
+
+	var r io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, h.http.URL+path, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := h.http.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck
+	return resp.StatusCode
+}
+
+// TestEveryRouteEnforcesItsScope is the table that makes the whole scheme
+// checkable at a glance: for each route, which credential gets in and which
+// does not. Writing it as one table rather than as scattered assertions is what
+// makes a route added later without a scope visible as a missing row.
+func TestEveryRouteEnforcesItsScope(t *testing.T) {
+	h := newAuthedHarness(t)
+
+	// A deployed model, so the routes reach their handlers instead of 404ing
+	// before the scope check would matter.
+	h.call(t, "POST", "/v1/models", adminToken, createModelRequest{Name: "guarded"})
+	version := h.uploadAs(t, "guarded", "binary_logistic.model.json", featureNames(6), adminToken)
+	h.call(t, "PUT", "/v1/models/guarded/policy", adminToken, routing.Policy{
+		Routes: []routing.Route{{Version: version, Weight: 1}},
+	})
+
+	predictBody := PredictRequest{Features: map[string]float64{"f0": 1}}
+	policyBody := routing.Policy{Routes: []routing.Route{{Version: version, Weight: 1}}}
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   any
+		// allowed lists the tokens that must succeed; every other token must
+		// be refused with 403.
+		allowed []string
+	}{
+		{"predict", "POST", "/v1/models/guarded/predict", predictBody, []string{predictToken, adminToken}},
+
+		{"list models", "GET", "/v1/models", nil, []string{readToken, adminToken}},
+		{"get model", "GET", "/v1/models/guarded", nil, []string{readToken, adminToken}},
+		{"list versions", "GET", "/v1/models/guarded/versions", nil, []string{readToken, adminToken}},
+		{"get policy", "GET", "/v1/models/guarded/policy", nil, []string{readToken, adminToken}},
+		{"drift", "GET", "/v1/models/guarded/versions/1/drift", nil, []string{readToken, adminToken}},
+		{"stats", "GET", "/v1/models/guarded/versions/1/stats", nil, []string{readToken, adminToken}},
+
+		{"create model", "POST", "/v1/models", createModelRequest{Name: "another"}, []string{adminToken}},
+		{"set policy", "PUT", "/v1/models/guarded/policy", policyBody, []string{adminToken}},
+		{"set baseline", "PUT", "/v1/models/guarded/versions/1/baseline", BaselineRequest{}, []string{adminToken}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// No credential at all is always 401.
+			if got := h.call(t, tc.method, tc.path, "", tc.body); got != http.StatusUnauthorized {
+				t.Errorf("no token = %d, want 401", got)
+			}
+			// An unrecognised credential is always 401, never 403.
+			if got := h.call(t, tc.method, tc.path, "made-up", tc.body); got != http.StatusUnauthorized {
+				t.Errorf("unknown token = %d, want 401", got)
+			}
+
+			for _, token := range []string{adminToken, readToken, predictToken} {
+				permitted := slices.Contains(tc.allowed, token)
+				got := h.call(t, tc.method, tc.path, token, tc.body)
+
+				if !permitted {
+					if got != http.StatusForbidden {
+						t.Errorf("token %s = %d, want 403 (it lacks the scope)", nameOf(token), got)
+					}
+					continue
+				}
+				if got == http.StatusUnauthorized || got == http.StatusForbidden {
+					t.Errorf("token %s = %d, but it should be permitted here", nameOf(token), got)
+				}
+			}
+		})
+	}
+}
+
+func nameOf(token string) string {
+	switch token {
+	case adminToken:
+		return "admin"
+	case readToken:
+		return "read"
+	case predictToken:
+		return "predict"
+	}
+	return "unknown"
+}
+
+// uploadAs is upload with an explicit credential.
+func (h *harness) uploadAs(t *testing.T, model, fixture string, features []string, token string) int {
+	t.Helper()
+
+	f, err := os.Open(fixturePath(fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	q := make([]string, 0, len(features))
+	for _, name := range features {
+		q = append(q, "feature="+name)
+	}
+	url := fmt.Sprintf("%s/v1/models/%s/versions?%s", h.http.URL, model, strings.Join(q, "&"))
+
+	req, err := http.NewRequest("POST", url, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := h.http.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload returned %d: %s", resp.StatusCode, body)
+	}
+	var out struct {
+		Version registry.Version `json:"version"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out.Version.Version
+}
+
+// TestPushingAModelRequiresAdmin is called out separately because it is the
+// most consequential unauthenticated write available: replacing the artifact a
+// model scores with is arbitrary control over every prediction it makes.
+func TestPushingAModelRequiresAdmin(t *testing.T) {
+	h := newAuthedHarness(t)
+	h.call(t, "POST", "/v1/models", adminToken, createModelRequest{Name: "protected"})
+
+	url := h.http.URL + "/v1/models/protected/versions?feature=f0"
+	for token, want := range map[string]int{
+		"":           http.StatusUnauthorized,
+		"nonsense":   http.StatusUnauthorized,
+		readToken:    http.StatusForbidden,
+		predictToken: http.StatusForbidden,
+	} {
+		req, err := http.NewRequest("POST", url, strings.NewReader("not a model"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := h.http.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("push with token %q = %d, want %d", nameOf(token), resp.StatusCode, want)
+		}
+	}
+}
+
+// TestHealthEndpointsStayOpen covers the deliberate exemption. A liveness probe
+// that needs a credential starts failing the moment a token is rotated or
+// misconfigured, and would then restart the very process that is serving
+// correctly.
+func TestHealthEndpointsStayOpen(t *testing.T) {
+	h := newAuthedHarness(t)
+
+	if got := h.call(t, "GET", "/healthz", "", nil); got != http.StatusOK {
+		t.Errorf("healthz without a credential = %d, want 200", got)
+	}
+	// readyz answers without a credential too; 503 here means "no models
+	// loaded", which is the readiness answer, not an auth refusal.
+	if got := h.call(t, "GET", "/readyz", "", nil); got == http.StatusUnauthorized || got == http.StatusForbidden {
+		t.Errorf("readyz without a credential = %d, want an availability answer", got)
+	}
+}
+
+// TestMetricsRequiresRead covers the other side of that judgement: /metrics
+// carries every model name, version, request volume and drift reading, which
+// together describe what a business scores and how much of it.
+func TestMetricsRequiresRead(t *testing.T) {
+	h := newAuthedHarness(t)
+	guarded := h.server.MetricsHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("modelforge_predictions_total 1")) //nolint:errcheck
+	}))
+	ts := httptest.NewServer(guarded)
+	defer ts.Close()
+
+	get := func(token string) int {
+		req, _ := http.NewRequest("GET", ts.URL, nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := get(""); got != http.StatusUnauthorized {
+		t.Errorf("metrics without a credential = %d, want 401", got)
+	}
+	if got := get(predictToken); got != http.StatusForbidden {
+		t.Errorf("metrics with a predict-only token = %d, want 403", got)
+	}
+	if got := get(readToken); got != http.StatusOK {
+		t.Errorf("metrics with a read token = %d, want 200", got)
+	}
+	if got := get(adminToken); got != http.StatusOK {
+		t.Errorf("metrics with an admin token = %d, want 200", got)
+	}
+}
+
+// TestNilAuthMeansDisabled documents the default in Deps. It is the behaviour
+// the pre-auth tests rely on, and it is safe only because app.New refuses to
+// construct a server without either tokens or an explicit opt-out.
+func TestNilAuthMeansDisabled(t *testing.T) {
+	h := newHarness(t) // built with no Auth
+	if got := h.call(t, "GET", "/v1/models", "", nil); got != http.StatusOK {
+		t.Errorf("nil Auth blocked a request with %d", got)
 	}
 }

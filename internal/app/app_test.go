@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sahilkalgutkar/modelforge/internal/artifact"
+	"github.com/sahilkalgutkar/modelforge/internal/auth"
 	"github.com/sahilkalgutkar/modelforge/internal/registry"
 	"github.com/sahilkalgutkar/modelforge/internal/routing"
 )
@@ -32,7 +33,43 @@ func testConfig(t *testing.T, artifactDir string) Config {
 		DatabaseURL: dsn,
 		ArtifactDir: artifactDir,
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// A real token rather than AuthDisabled, so the harness exercises the
+		// path production uses. Tests that want the unauthenticated path ask
+		// for it explicitly.
+		Tokens: []string{"test:admin:" + auth.Digest(testToken)},
 	}
+}
+
+// testToken is the credential the app tests present. It is a fixed literal
+// rather than a generated one so a failing test is reproducible.
+const testToken = "test-token-for-the-app-suite"
+
+// authed adds the bearer credential to a request.
+func authed(t *testing.T, req *http.Request) *http.Request {
+	t.Helper()
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	return req
+}
+
+// getAuthed is http.Get with the test credential.
+func getAuthed(t *testing.T, url string) (*http.Response, error) {
+	t.Helper()
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return http.DefaultClient.Do(authed(t, req))
+}
+
+// postAuthed is http.Post with the test credential.
+func postAuthed(t *testing.T, url, contentType string, body io.Reader) (*http.Response, error) {
+	t.Helper()
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	return http.DefaultClient.Do(authed(t, req))
 }
 
 func resetRegistry(t *testing.T, dsn string) {
@@ -62,7 +99,7 @@ func deploy(t *testing.T, cfg Config, model string) *App {
 	post := func(path string, body any) {
 		t.Helper()
 		b, _ := json.Marshal(body)
-		resp, err := http.Post(ts.URL+path, "application/json", bytes.NewReader(b))
+		resp, err := postAuthed(t, ts.URL+path, "application/json", bytes.NewReader(b))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -81,7 +118,7 @@ func deploy(t *testing.T, cfg Config, model string) *App {
 	}
 	defer f.Close()
 	q := "?feature=f0&feature=f1&feature=f2&feature=f3&feature=f4&feature=f5"
-	resp, err := http.Post(ts.URL+"/v1/models/"+model+"/versions"+q, "application/octet-stream", f)
+	resp, err := postAuthed(t, ts.URL+"/v1/models/"+model+"/versions"+q, "application/octet-stream", f)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +131,7 @@ func deploy(t *testing.T, cfg Config, model string) *App {
 	b, _ := json.Marshal(routing.Policy{Routes: []routing.Route{{Version: 1, Weight: 1}}})
 	req, _ := http.NewRequest("PUT", ts.URL+"/v1/models/"+model+"/policy", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
-	presp, err := http.DefaultClient.Do(req)
+	presp, err := http.DefaultClient.Do(authed(t, req))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +173,7 @@ func TestPoliciesSurviveARestart(t *testing.T) {
 	ts := httptest.NewServer(second.Handler())
 	defer ts.Close()
 
-	resp, err := http.Post(ts.URL+"/v1/models/restarted/predict", "application/json",
+	resp, err := postAuthed(t, ts.URL+"/v1/models/restarted/predict", "application/json",
 		strings.NewReader(`{"features":{"f0":1,"f1":2}}`))
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +185,7 @@ func TestPoliciesSurviveARestart(t *testing.T) {
 	}
 
 	// Readiness must also pass, or a rollout would never send it traffic.
-	rresp, err := http.Get(ts.URL + "/readyz")
+	rresp, err := http.Get(ts.URL + "/readyz") // deliberately unauthenticated
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,10 +324,10 @@ func TestMetricsEndpointIsServed(t *testing.T) {
 	defer ts.Close()
 
 	//nolint:errcheck // generating a metric to scrape
-	http.Post(ts.URL+"/v1/models/metered/predict", "application/json",
+	postAuthed(t, ts.URL+"/v1/models/metered/predict", "application/json",
 		strings.NewReader(`{"features":{"f0":1}}`))
 
-	resp, err := http.Get(ts.URL + "/metrics")
+	resp, err := getAuthed(t, ts.URL+"/metrics")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +405,7 @@ func TestRunServesThenShutsDownCleanly(t *testing.T) {
 		t.Fatal("server never started listening")
 	}
 
-	resp, err := http.Post(base+"/v1/models/served/predict", "application/json",
+	resp, err := postAuthed(t, base+"/v1/models/served/predict", "application/json",
 		strings.NewReader(`{"features":{"f0":1,"f1":2}}`))
 	if err != nil {
 		t.Fatal(err)
@@ -420,5 +457,149 @@ func TestRunFailsOnAnAddressAlreadyInUse(t *testing.T) {
 	defer cancel()
 	if err := a.Run(ctx); err == nil {
 		t.Fatal("Run succeeded on an address already in use")
+	}
+}
+
+// --- authentication configuration ---
+
+// TestStartupFailsClosedWithoutTokens is the decision that matters most in this
+// whole feature. Defaulting to open would mean a server that comes up, serves,
+// and looks entirely healthy while its control plane is available to anybody
+// who can reach the port — and no log line anybody actually reads beats simply
+// not starting.
+func TestStartupFailsClosedWithoutTokens(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.Tokens = nil
+
+	a, err := New(context.Background(), cfg)
+	if err == nil {
+		a.Close()
+		t.Fatal("the server started with no tokens and no explicit opt-out")
+	}
+	// The error has to say what to do, or it just moves the confusion.
+	for _, want := range []string{"modelforgectl token", "MODELFORGE_TOKENS", "-auth-disabled"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("startup error does not mention %q: %v", want, err)
+		}
+	}
+}
+
+// TestAuthCanBeDisabledDeliberately covers the escape hatch. It exists because
+// local development and this suite genuinely do not want tokens, and a flag
+// somebody had to type is very different from a default nobody chose.
+func TestAuthCanBeDisabledDeliberately(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.Tokens = nil
+	cfg.AuthDisabled = true
+
+	a, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New with -auth-disabled: %v", err)
+	}
+	defer a.Close()
+
+	if !a.auth.IsDisabled() {
+		t.Fatal("auth is not disabled despite AuthDisabled")
+	}
+
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/v1/models") // no credential
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("disabled auth still refused a request: %d", resp.StatusCode)
+	}
+}
+
+// TestTokensAndDisabledTogetherIsRejected refuses to guess. Deciding for the
+// operator which half of a contradictory configuration they meant is exactly
+// the wrong instinct to have about a security control.
+func TestTokensAndDisabledTogetherIsRejected(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.AuthDisabled = true // Tokens is already set by testConfig
+
+	a, err := New(context.Background(), cfg)
+	if err == nil {
+		a.Close()
+		t.Fatal("New accepted both tokens and -auth-disabled")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("error should call the configuration ambiguous: %v", err)
+	}
+}
+
+func TestStartupRejectsMalformedTokens(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+	cfg.Tokens = []string{"broken-entry-with-no-digest"}
+
+	a, err := New(context.Background(), cfg)
+	if err == nil {
+		a.Close()
+		t.Fatal("New accepted a malformed token entry")
+	}
+}
+
+// TestServingRequiresACredential is the end-to-end version of the same claim,
+// through a fully wired app rather than a hand-built server.
+func TestServingRequiresACredential(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+
+	a := deploy(t, cfg, "guarded")
+	defer a.Close()
+
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/v1/models/guarded/predict", "application/json",
+		strings.NewReader(`{"features":{"f0":1}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("predict without a credential = %d, want 401", resp.StatusCode)
+	}
+
+	// And the same request with the credential succeeds, so the 401 above is
+	// authentication rather than something else being broken.
+	ok, err := postAuthed(t, ts.URL+"/v1/models/guarded/predict", "application/json",
+		strings.NewReader(`{"features":{"f0":1}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(ok.Body)
+		t.Fatalf("predict with a credential = %d: %s", ok.StatusCode, body)
+	}
+}
+
+// TestMetricsRequiresACredentialEndToEnd checks the wiring in app.New actually
+// wrapped the metrics handler, not just that the API can wrap one.
+func TestMetricsRequiresACredentialEndToEnd(t *testing.T) {
+	cfg := testConfig(t, t.TempDir())
+	resetRegistry(t, cfg.DatabaseURL)
+
+	a := deploy(t, cfg, "metered")
+	defer a.Close()
+
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("/metrics without a credential = %d, want 401", resp.StatusCode)
 	}
 }
