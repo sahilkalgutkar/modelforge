@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sahilkalgutkar/modelforge/internal/artifact"
+	"github.com/sahilkalgutkar/modelforge/internal/auth"
 	"github.com/sahilkalgutkar/modelforge/internal/batch"
 	"github.com/sahilkalgutkar/modelforge/internal/drift"
 	"github.com/sahilkalgutkar/modelforge/internal/registry"
@@ -33,6 +34,8 @@ type Deps struct {
 	Manager  *serving.Manager
 	Router   *routing.Router
 	Logger   *slog.Logger
+	// Auth guards the routes. A nil Auth is treated as explicitly disabled.
+	Auth *auth.Authenticator
 	// Metrics is optional; a nil Metrics means the handlers do not record.
 	Metrics Recorder
 }
@@ -55,30 +58,67 @@ func NewServer(deps Deps) *Server {
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
 	}
+	if deps.Auth == nil {
+		// A nil Authenticator would mean every route silently ran unguarded,
+		// which is the exact failure this is meant to prevent. Turning auth
+		// off has to be said out loud.
+		deps.Auth = auth.Disabled()
+	}
 	s := &Server{deps: deps, mux: http.NewServeMux()}
+	mw := auth.NewMiddleware(deps.Auth, deps.Logger)
 
-	// Serving.
-	s.mux.HandleFunc("POST /v1/models/{model}/predict", s.handlePredict)
+	// Serving. Separate from read on purpose: the credential a high-volume
+	// caller ships to production should be able to score and nothing else, so
+	// leaking it does not also expose which models exist and how they are
+	// deployed.
+	s.mux.Handle("POST /v1/models/{model}/predict",
+		mw.RequireFunc(auth.ScopePredict, s.handlePredict))
 
-	// Control plane.
-	s.mux.HandleFunc("POST /v1/models", s.handleCreateModel)
-	s.mux.HandleFunc("GET /v1/models", s.handleListModels)
-	s.mux.HandleFunc("GET /v1/models/{model}", s.handleGetModel)
-	s.mux.HandleFunc("POST /v1/models/{model}/versions", s.handleCreateVersion)
-	s.mux.HandleFunc("GET /v1/models/{model}/versions", s.handleListVersions)
-	s.mux.HandleFunc("PUT /v1/models/{model}/policy", s.handleSetPolicy)
-	s.mux.HandleFunc("GET /v1/models/{model}/policy", s.handleGetPolicy)
-	s.mux.HandleFunc("PUT /v1/models/{model}/versions/{version}/baseline", s.handleSetBaseline)
-	s.mux.HandleFunc("GET /v1/models/{model}/versions/{version}/drift", s.handleDrift)
-	s.mux.HandleFunc("GET /v1/models/{model}/versions/{version}/stats", s.handleStats)
+	// Control plane. Reads and writes are split so a dashboard or an on-call
+	// script can be given a credential that cannot change what serves traffic.
+	for pattern, h := range map[string]http.HandlerFunc{
+		"GET /v1/models":                                  s.handleListModels,
+		"GET /v1/models/{model}":                          s.handleGetModel,
+		"GET /v1/models/{model}/versions":                 s.handleListVersions,
+		"GET /v1/models/{model}/policy":                   s.handleGetPolicy,
+		"GET /v1/models/{model}/versions/{version}/drift": s.handleDrift,
+		"GET /v1/models/{model}/versions/{version}/stats": s.handleStats,
+	} {
+		s.mux.Handle(pattern, mw.RequireFunc(auth.ScopeRead, h))
+	}
+	for pattern, h := range map[string]http.HandlerFunc{
+		"POST /v1/models":                                    s.handleCreateModel,
+		"POST /v1/models/{model}/versions":                   s.handleCreateVersion,
+		"PUT /v1/models/{model}/policy":                      s.handleSetPolicy,
+		"PUT /v1/models/{model}/versions/{version}/baseline": s.handleSetBaseline,
+	} {
+		s.mux.Handle(pattern, mw.RequireFunc(auth.ScopeAdmin, h))
+	}
 
-	// Operations.
+	// Operations. Deliberately unauthenticated.
+	//
+	// A liveness probe that needs a credential is a probe that starts failing
+	// the moment a token is rotated or misconfigured — and it would then
+	// restart the very process that is serving correctly. Neither endpoint
+	// reveals anything beyond whether the process is up and how many models it
+	// holds, which is not worth that failure mode.
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	s.mux.HandleFunc("GET /readyz", s.handleReady)
 
 	return s
+}
+
+// MetricsHandler wraps a metrics handler in the read scope.
+//
+// /metrics is protected because it is not neutral: it carries every model name,
+// every version, request volumes and drift readings, which together describe
+// what a business is scoring and how much of it. Prometheus can send a bearer
+// token from its scrape config, so the cost of protecting it is one line of
+// configuration.
+func (s *Server) MetricsHandler(h http.Handler) http.Handler {
+	return auth.NewMiddleware(s.deps.Auth, s.deps.Logger).Require(auth.ScopeRead, h)
 }
 
 // Handler returns the HTTP handler.

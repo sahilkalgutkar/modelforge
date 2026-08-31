@@ -20,6 +20,7 @@ import (
 
 	"github.com/sahilkalgutkar/modelforge/internal/api"
 	"github.com/sahilkalgutkar/modelforge/internal/artifact"
+	"github.com/sahilkalgutkar/modelforge/internal/auth"
 	"github.com/sahilkalgutkar/modelforge/internal/metrics"
 	"github.com/sahilkalgutkar/modelforge/internal/registry"
 	"github.com/sahilkalgutkar/modelforge/internal/routing"
@@ -35,6 +36,14 @@ type Config struct {
 	// DriftInterval is how often drift readings are refreshed into metrics.
 	DriftInterval time.Duration
 	Logger        *slog.Logger
+
+	// Tokens are `name:scopes:sha256hex` entries; see internal/auth.
+	Tokens []string
+
+	// AuthDisabled runs the server with no authentication. It has to be set
+	// explicitly: an unset Tokens list is a configuration mistake, not a
+	// request to serve the control plane to anyone who can reach the port.
+	AuthDisabled bool
 }
 
 // App is a running server's dependencies.
@@ -46,6 +55,7 @@ type App struct {
 	router   *routing.Router
 	metrics  *metrics.Metrics
 	handler  http.Handler
+	auth     *auth.Authenticator
 }
 
 // New connects to the database, opens the artifact store, and restores the
@@ -65,6 +75,11 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	blobs, err := artifact.NewFileStore(cfg.ArtifactDir)
 	if err != nil {
 		reg.Close()
+		return nil, err
+	}
+
+	authn, err := buildAuth(cfg)
+	if err != nil {
 		return nil, err
 	}
 
@@ -88,14 +103,57 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		return nil, err
 	}
 
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(promReg, promhttp.HandlerOpts{}))
-	mux.Handle("/", api.NewServer(api.Deps{
+	apiSrv := api.NewServer(api.Deps{
 		Registry: reg, Manager: manager, Router: router,
-		Logger: cfg.Logger, Metrics: met,
-	}))
+		Logger: cfg.Logger, Metrics: met, Auth: authn,
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", apiSrv.MetricsHandler(
+		promhttp.HandlerFor(promReg, promhttp.HandlerOpts{})))
+	mux.Handle("/", apiSrv)
 	a.handler = mux
+	a.auth = authn
 	return a, nil
+}
+
+// buildAuth turns the configuration into an Authenticator, failing closed.
+//
+// Starting with no tokens and no explicit opt-out is refused rather than
+// defaulted to open. Getting this wrong is silent in the worst way: the server
+// comes up, serves, and looks entirely healthy while its control plane is
+// available to anybody who can reach the port. There is no log line anybody
+// reads that reliably beats simply not starting.
+//
+// The opt-out exists because local development and the test suite genuinely do
+// not want tokens, and an escape hatch that has to be named is very different
+// from a default that nobody chose.
+func buildAuth(cfg Config) (*auth.Authenticator, error) {
+	if cfg.AuthDisabled {
+		if len(cfg.Tokens) > 0 {
+			// Both set is ambiguous, and guessing which one the operator meant
+			// is exactly the wrong thing to do about a security control.
+			return nil, errors.New("app: tokens are configured but authentication is disabled; " +
+				"remove one or the other rather than leaving it ambiguous")
+		}
+		cfg.Logger.Warn("authentication is DISABLED; the control plane is open to anyone who can reach this port")
+		return auth.Disabled(), nil
+	}
+
+	if len(cfg.Tokens) == 0 {
+		return nil, errors.New("app: no API tokens configured. Mint one with " +
+			"`modelforgectl token <name> <scope>` and set MODELFORGE_TOKENS, or pass " +
+			"-auth-disabled to run without authentication deliberately")
+	}
+
+	authn, err := auth.New(cfg.Tokens)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range authn.Tokens() {
+		cfg.Logger.Info("api token configured", "token", t.Name, "scopes", t.Scopes)
+	}
+	return authn, nil
 }
 
 // Handler returns the HTTP handler, for tests and for main.
