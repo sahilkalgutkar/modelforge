@@ -109,3 +109,24 @@ func TestAuthThrottledCounter(t *testing.T) {
 		t.Errorf("the throttle counter carries labels, risking cardinality explosion:\n%s", out)
 	}
 }
+
+func TestAuthReloadMetrics(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := New(reg)
+
+	m.ObserveAuthReload("applied", 3)
+	m.ObserveAuthReload("unchanged", 3)
+	m.ObserveAuthReload("failed", 0)
+
+	for outcome, want := range map[string]float64{"applied": 1, "unchanged": 1, "failed": 1} {
+		if got := testutil.ToFloat64(m.authReloads.WithLabelValues(outcome)); got != want {
+			t.Errorf("reload outcome %q = %v, want %v", outcome, got, want)
+		}
+	}
+	// A failed reload leaves the gauge showing what is actually in force,
+	// which is the previous set — reporting zero would say the server has no
+	// tokens when it is still happily serving with the old ones.
+	if got := testutil.ToFloat64(m.authTokens); got != 3 {
+		t.Errorf("token gauge = %v after a failed reload, want the count still in force (3)", got)
+	}
+}

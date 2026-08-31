@@ -128,8 +128,9 @@ make db        # Postgres on :5432, plus the test database
 make run       # mints development tokens, then serves on :8080
 ```
 
-`make run` writes `deploy/dev-tokens.env` on first use, holding an admin token
-for the CLI and a read token for Prometheus. Source it before using the client:
+`make run` writes `deploy/tokens` on first use — the server's reloadable token
+file — plus `deploy/dev-tokens.env` holding the matching admin token for the
+CLI. Source it before using the client:
 
 ```bash
 source deploy/dev-tokens.env
@@ -291,6 +292,66 @@ default nobody chose. Setting both is rejected rather than resolved, because
 guessing which half of a contradictory security configuration was meant is
 exactly the wrong instinct.
 
+### Rotating a token without restarting
+
+Tokens come from a file that is re-read on `SIGHUP` and on a timer, so replacing
+a credential never involves restarting the process:
+
+```bash
+modelforgectl token ci-next admin          # mint the replacement
+echo 'ci-next:admin:<digest>' >> deploy/tokens   # both valid now
+kill -HUP $(pgrep -f bin/modelforge)       # overlap begins
+
+# ... move clients onto the new token at their own pace ...
+
+sed -i '/^ci:admin:/d' deploy/tokens       # withdraw the old one
+kill -HUP $(pgrep -f bin/modelforge)
+```
+
+`make rotate` does exactly this for the development token.
+
+**The overlap is the point.** A single-step swap breaks every client that has
+not been updated yet, which is why rotation gets deferred until a credential is
+years old. Two steps with both valid in between makes it something you can do on
+a Tuesday.
+
+Measured on a running server: **400 requests during 40 live reloads, all 200,
+same PID throughout.** The token set is swapped through an atomic pointer, so a
+request sees exactly one generation of it — never a state where the new token is
+present and the old one is already gone. The read path takes no lock, so
+rotation costs serving nothing.
+
+**A bad rotation is not an outage.** The file is read, parsed and validated
+before anything is swapped, so a malformed entry, an empty file, a file that is
+briefly missing mid-rewrite, or one that got entirely commented out leaves the
+running set in force. It logs, counts `modelforge_auth_reloads_total{outcome="failed"}`,
+and keeps serving. There is an alert for that counter, because a failed reload is
+invisible from the outside — the server looks healthy and the rotation simply did
+not happen.
+
+**Why a file and not an admin endpoint.** An API that mints tokens turns any
+admin compromise into permanent access: the attacker issues a credential of their
+own and keeps it after the stolen one is revoked. Keeping issuance outside the
+serving process means this server only ever learns digests. It is also the only
+mechanism that works with a Kubernetes Secret or a Vault agent, both of which
+rewrite a mounted file in place and neither of which can call an API — which is
+why there is a poll as well as a signal.
+
+### Expiry
+
+An entry may carry an RFC 3339 deadline as a fourth field:
+
+```
+ci-temp:read:<digest>:2026-12-01T00:00:00Z
+```
+
+It is checked on every request rather than at load time, so the credential stops
+working at its deadline whether or not anybody reloads. That is what makes "we
+will clean up the old token later" safe — later happens on its own. An expired
+token gets a distinct error from an unrecognised one, which leaks nothing the
+holder does not already know and is the difference between a minute of rotation
+and an hour hunting a phantom typo.
+
 ### What is deliberately left open
 
 `/healthz` and `/readyz` need no credential. A liveness probe that needs one
@@ -405,7 +466,7 @@ and a fake agrees with whatever the code happens to do.
 same database and truncate it between cases, so running packages concurrently
 has them resetting the database underneath each other.
 
-Coverage is **91.6%** of `internal/`, measured with `-coverpkg` so that code is
+Coverage is **91.9%** of `internal/`, measured with `-coverpkg` so that code is
 attributed to the package that owns it rather than the package running the test
 — without it the end-to-end suites, which exercise serving and routing through
 HTTP, would report those packages as untested.
@@ -428,6 +489,8 @@ fail silently:
 | `TestOnlyControlPlaneChangesAreAudited` | an audit log drowned in one line per prediction |
 | `TestAValidCredentialIsNeverThrottled` | a shared IP turning a rate limit into an outage |
 | `TestSaturatedTableFailsOpen` | an attacker filling the limiter's table to lock others out |
+| `TestReloadIsAtomic` | a request mid-rotation seeing neither credential |
+| `TestABadRotationDoesNotTakeTheServerDown` | a malformed token file locking everyone out |
 
 ## Known limitations
 
@@ -447,10 +510,12 @@ I would rather write these down than let someone discover them.
 - **The rollout guard reacts to errors, not to quality.** It catches a version
   that is throwing, not one that is quietly predicting badly — that needs
   labels, which arrive long after the request.
-- **Tokens are static, and there is no revocation list.** Rotating one means
-  editing the server's configuration and restarting, which is fine for a handful
-  of long-lived credentials and wrong for per-user tokens. Short-lived
-  credentials would want OIDC and a JWKS endpoint, which is a different design.
+- **Tokens are long-lived credentials, not sessions.** They rotate without a
+  restart and can carry an expiry, but there is no issuer, no refresh and no
+  per-user identity. Short-lived credentials would want OIDC and a JWKS
+  endpoint, which is a different design.
+- **Revocation is as fast as the reload.** A withdrawn token stops working on
+  the next `SIGHUP`, or within the poll interval — not instantly across a fleet.
 - **Rate limiting keys on the client address, which is a shared resource.**
   Behind a NAT everyone shares a bucket, so a burst of 10 is per egress rather
   than per person. A valid credential is never refused, which is what keeps that

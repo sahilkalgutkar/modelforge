@@ -3,7 +3,7 @@
 DB ?= postgres://modelforge:modelforge@localhost:5432/modelforge?sslmode=disable
 TEST_DB ?= postgres://modelforge:modelforge@localhost:5432/modelforge_test?sslmode=disable
 
-.PHONY: build test cover lint fixtures db up run tokens clean
+.PHONY: build test cover lint fixtures db up run tokens rotate clean
 
 build:
 	CGO_ENABLED=0 go build -o bin/modelforge ./cmd/modelforge
@@ -48,19 +48,33 @@ tokens: build
 	@./bin/modelforgectl token dev admin --env > deploy/.admin.env
 	@./bin/modelforgectl token prometheus read --env > deploy/.scrape.env
 	@. ./deploy/.scrape.env; printf '%s' "$$MODELFORGE_TOKEN" > deploy/prometheus-token
-	@. ./deploy/.admin.env; ADMIN_ENTRY="$$MODELFORGE_TOKENS_ENTRY"; ADMIN="$$MODELFORGE_TOKEN"; \
+	@. ./deploy/.admin.env; ADMIN="$$MODELFORGE_TOKEN"; ADMIN_ENTRY="$$MODELFORGE_TOKENS_ENTRY"; \
 	 . ./deploy/.scrape.env; \
 	 { \
-	   echo "export MODELFORGE_TOKEN=$$ADMIN"; \
-	   echo "export MODELFORGE_TOKENS=$$ADMIN_ENTRY,$$MODELFORGE_TOKENS_ENTRY"; \
-	 } > deploy/dev-tokens.env
+	   echo "# Development tokens. Rewrite this file and SIGHUP the server to rotate;"; \
+	   echo "# it is also re-read on a timer. Never commit it."; \
+	   echo "$$ADMIN_ENTRY"; \
+	   echo "$$MODELFORGE_TOKENS_ENTRY"; \
+	 } > deploy/tokens
+	@. ./deploy/.admin.env; echo "export MODELFORGE_TOKEN=$$MODELFORGE_TOKEN" > deploy/dev-tokens.env
 	@rm -f deploy/.admin.env deploy/.scrape.env
-	@echo "wrote deploy/dev-tokens.env (admin + prometheus read tokens)"
+	@echo "wrote deploy/tokens (server) and deploy/dev-tokens.env (client)"
+
+# Rotate the development admin token in place, with an overlap, without
+# restarting the server. This is the same procedure the README documents.
+rotate: build
+	@./bin/modelforgectl token dev-next admin --env > deploy/.next.env
+	@. ./deploy/.next.env; \
+	  echo "$$MODELFORGE_TOKENS_ENTRY" >> deploy/tokens; \
+	  echo "export MODELFORGE_TOKEN=$$MODELFORGE_TOKEN" > deploy/dev-tokens.env
+	@rm -f deploy/.next.env
+	@pkill -HUP -f 'bin/modelforge -addr' 2>/dev/null || true
+	@echo "new token added and the server signalled; both are now valid."
+	@echo "source deploy/dev-tokens.env, then remove the old line from deploy/tokens and SIGHUP again."
 
 run: build
-	@test -f deploy/dev-tokens.env || $(MAKE) tokens
-	set -a; . ./deploy/dev-tokens.env; set +a; \
-	  MODELFORGE_DATABASE_URL="$(DB)" ./bin/modelforge
+	@test -f deploy/tokens || $(MAKE) tokens
+	MODELFORGE_DATABASE_URL="$(DB)" ./bin/modelforge -token-file deploy/tokens
 
 clean:
-	rm -rf bin coverage.out coverage.html var deploy/prometheus-token deploy/dev-tokens.env
+	rm -rf bin coverage.out coverage.html var deploy/prometheus-token deploy/dev-tokens.env deploy/tokens

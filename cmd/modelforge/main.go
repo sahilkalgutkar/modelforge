@@ -25,6 +25,10 @@ func main() {
 	flag.DurationVar(&cfg.DriftInterval, "drift-interval", 30*time.Second, "how often drift readings refresh")
 	tokens := flag.String("tokens", os.Getenv("MODELFORGE_TOKENS"),
 		"comma-separated API tokens as name:scopes:sha256hex (mint with `modelforgectl token`)")
+	flag.StringVar(&cfg.TokenFile, "token-file", os.Getenv("MODELFORGE_TOKEN_FILE"),
+		"path to reloadable token entries, one per line; re-read on SIGHUP and on a timer")
+	flag.DurationVar(&cfg.TokenReloadInterval, "token-reload-interval", 30*time.Second,
+		"how often to re-read -token-file (negative disables polling; SIGHUP always works)")
 	authDisabled := flag.Bool("auth-disabled", os.Getenv("MODELFORGE_AUTH_DISABLED") == "true",
 		"serve with no authentication at all")
 	flag.IntVar(&cfg.AuthMaxFailures, "auth-max-failures", 10,

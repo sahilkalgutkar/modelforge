@@ -25,6 +25,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 // Scope is a capability a token carries.
@@ -51,6 +53,15 @@ var (
 	ErrBadCredential = errors.New("auth: unrecognised token")
 	// ErrForbidden means the token is valid but lacks the required scope.
 	ErrForbidden = errors.New("auth: token lacks the required scope")
+	// ErrExpiredCredential means the token was recognised but is past its
+	// deadline.
+	//
+	// It is deliberately distinct from ErrBadCredential. Saying "expired"
+	// tells the holder something they already know — they possess the token —
+	// so it leaks nothing, and it is the difference between an operator
+	// rotating a credential in a minute and hunting a phantom typo for an
+	// hour.
+	ErrExpiredCredential = errors.New("auth: token has expired")
 )
 
 // Token is a configured credential. It holds no secret — only the name used in
@@ -58,6 +69,20 @@ var (
 type Token struct {
 	Name   string
 	Scopes []Scope
+
+	// NotAfter is when this credential stops being accepted. The zero value
+	// means it never expires.
+	//
+	// It is checked on every request rather than only at load time, so a token
+	// stops working at its deadline whether or not anybody reloads the file.
+	// That is what makes "we will clean up the old credential later" safe:
+	// later happens on its own.
+	NotAfter time.Time
+}
+
+// Expired reports whether the token is past its deadline.
+func (t Token) Expired(now time.Time) bool {
+	return !t.NotAfter.IsZero() && now.After(t.NotAfter)
 }
 
 // Allows reports whether the token carries a scope.
@@ -85,27 +110,59 @@ func (t Token) String() string {
 	return fmt.Sprintf("%s[%s]", t.Name, strings.Join(names, "+"))
 }
 
-// Authenticator checks bearer tokens against a configured set.
-type Authenticator struct {
-	// byDigest maps the hex SHA-256 of a token to what it grants.
-	//
-	// Looking a token up by the digest of what the caller presented is what
-	// makes the comparison timing-safe. The classic leak is comparing a secret
-	// byte by byte and returning early, which lets an attacker discover it one
-	// character at a time. Here the caller's guess is hashed first, so changing
-	// one bit of the guess changes the whole digest and a near-miss looks
-	// exactly like a wild miss.
+// tokenSet is one immutable generation of the configured tokens.
+//
+// byDigest maps the hex SHA-256 of a token to what it grants. Looking a token
+// up by the digest of what the caller presented is what makes the comparison
+// timing-safe. The classic leak is comparing a secret byte by byte and
+// returning early, which lets an attacker discover it one character at a time.
+// Here the caller's guess is hashed first, so changing one bit of the guess
+// changes the whole digest and a near-miss looks exactly like a wild miss.
+type tokenSet struct {
 	byDigest map[string]Token
+	loadedAt time.Time
+}
+
+// Authenticator checks bearer tokens against a configured set.
+//
+// The set is replaced wholesale rather than mutated, and swapped through an
+// atomic pointer. Two things follow from that, both of which matter on a
+// serving path.
+//
+// The read side takes no lock, so authenticating a request costs a hash and a
+// map lookup no matter how often tokens are rotated — a mutex here would put
+// every request behind whatever a reload is doing.
+//
+// And a request sees exactly one generation of the set. Mutating a shared map
+// in place would let a request arriving mid-rotation observe a state where the
+// new token is present and the old one is already gone, which is precisely the
+// window rotation exists to avoid.
+type Authenticator struct {
+	set atomic.Pointer[tokenSet]
 
 	// disabled runs the server with no authentication at all. It exists so
 	// that turning auth off is a visible, deliberate act recorded in the
 	// process's own configuration, rather than something that happens by
 	// default when nobody sets a token.
 	disabled bool
+
+	now func() time.Time
+}
+
+// Option configures an Authenticator.
+type Option func(*Authenticator)
+
+// WithClock replaces the clock used for expiry, for tests.
+func WithClock(now func() time.Time) Option {
+	return func(a *Authenticator) { a.now = now }
 }
 
 // Disabled builds an Authenticator that allows everything.
-func Disabled() *Authenticator { return &Authenticator{disabled: true} }
+func Disabled() *Authenticator {
+	a := &Authenticator{disabled: true, now: time.Now}
+	a.set.Store(&tokenSet{byDigest: map[string]Token{}})
+	return a
+}
 
 // IsDisabled reports whether authentication is off.
 func (a *Authenticator) IsDisabled() bool { return a.disabled }
@@ -113,8 +170,9 @@ func (a *Authenticator) IsDisabled() bool { return a.disabled }
 // Tokens returns the configured tokens, for startup logging. It exposes names
 // and scopes only.
 func (a *Authenticator) Tokens() []Token {
-	out := make([]Token, 0, len(a.byDigest))
-	for _, t := range a.byDigest {
+	current := a.set.Load()
+	out := make([]Token, 0, len(current.byDigest))
+	for _, t := range current.byDigest {
 		out = append(out, t)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -131,63 +189,169 @@ func (a *Authenticator) Tokens() []Token {
 // because an Authenticator with no tokens would reject every request while
 // looking configured — a failure that presents as "the API is broken" rather
 // than as "you did not set this up".
-func New(entries []string) (*Authenticator, error) {
-	a := &Authenticator{byDigest: make(map[string]Token, len(entries))}
-
-	for _, raw := range entries {
-		entry := strings.TrimSpace(raw)
-		if entry == "" {
-			continue
-		}
-		name, scopes, digest, err := parseEntry(entry)
-		if err != nil {
-			return nil, err
-		}
-		if existing, dup := a.byDigest[digest]; dup {
-			// Two names sharing a digest means the same secret was issued
-			// twice, so revoking one would silently leave the other working.
-			return nil, fmt.Errorf("auth: tokens %q and %q have the same digest", existing.Name, name)
-		}
-		a.byDigest[digest] = Token{Name: name, Scopes: scopes}
+func New(entries []string, opts ...Option) (*Authenticator, error) {
+	a := &Authenticator{now: time.Now}
+	for _, o := range opts {
+		o(a)
 	}
 
-	if len(a.byDigest) == 0 {
-		return nil, errors.New("auth: no tokens configured")
+	set, err := buildSet(entries, a.now())
+	if err != nil {
+		return nil, err
 	}
+	a.set.Store(set)
 	return a, nil
 }
 
-func parseEntry(entry string) (name string, scopes []Scope, digest string, err error) {
-	parts := strings.Split(entry, ":")
-	if len(parts) != 3 {
-		return "", nil, "", fmt.Errorf("auth: token entry %q must be name:scopes:sha256hex", redactEntry(entry))
-	}
-	name = strings.TrimSpace(parts[0])
-	if name == "" {
-		return "", nil, "", errors.New("auth: token entry has an empty name")
+// Change describes what a reload did, for logging. It carries token names and
+// never any secret.
+type Change struct {
+	Added   []string
+	Removed []string
+	// Expired lists tokens that are configured but already past their
+	// deadline. They are loaded and then refused, rather than dropped, so that
+	// a caller presenting one gets "expired" instead of "unrecognised".
+	Expired []string
+	Total   int
+}
+
+// Empty reports whether the reload changed nothing.
+func (c Change) Empty() bool { return len(c.Added) == 0 && len(c.Removed) == 0 }
+
+// Reload replaces the token set, and reports what changed.
+//
+// It builds and validates the whole new set before swapping, so a malformed or
+// empty configuration leaves the running set untouched. That is the property
+// the whole feature depends on: a bad rotation should be a failed reload that
+// gets logged, not an outage that locks every client out of a server that is
+// otherwise healthy. The error is returned for the caller to log; the old
+// credentials keep working either way.
+func (a *Authenticator) Reload(entries []string) (Change, error) {
+	if a.disabled {
+		return Change{}, errors.New("auth: cannot reload tokens while authentication is disabled")
 	}
 
+	next, err := buildSet(entries, a.now())
+	if err != nil {
+		return Change{}, err
+	}
+
+	previous := a.set.Swap(next)
+	return diff(previous, next, a.now()), nil
+}
+
+// LoadedAt is when the current token set was installed.
+func (a *Authenticator) LoadedAt() time.Time { return a.set.Load().loadedAt }
+
+// Count is how many tokens are configured.
+func (a *Authenticator) Count() int { return len(a.set.Load().byDigest) }
+
+func diff(previous, next *tokenSet, now time.Time) Change {
+	c := Change{Total: len(next.byDigest)}
+
+	for d, t := range next.byDigest {
+		if _, existed := previous.byDigest[d]; !existed {
+			c.Added = append(c.Added, t.Name)
+		}
+		if t.Expired(now) {
+			c.Expired = append(c.Expired, t.Name)
+		}
+	}
+	for d, t := range previous.byDigest {
+		if _, kept := next.byDigest[d]; !kept {
+			c.Removed = append(c.Removed, t.Name)
+		}
+	}
+	sort.Strings(c.Added)
+	sort.Strings(c.Removed)
+	sort.Strings(c.Expired)
+	return c
+}
+
+// buildSet parses entries into an immutable token set.
+//
+// It returns an error rather than an empty set when given nothing, because a
+// set with no tokens would reject every request while looking configured — a
+// failure that presents as "the API is broken" rather than as "you did not set
+// this up", and one that a reload must never be able to install.
+func buildSet(entries []string, now time.Time) (*tokenSet, error) {
+	set := &tokenSet{byDigest: make(map[string]Token, len(entries)), loadedAt: now}
+
+	for _, raw := range entries {
+		entry := strings.TrimSpace(raw)
+		if entry == "" || strings.HasPrefix(entry, "#") {
+			continue
+		}
+		tok, digest, err := parseEntry(entry)
+		if err != nil {
+			return nil, err
+		}
+		if existing, dup := set.byDigest[digest]; dup {
+			// Two names sharing a digest means the same secret was issued
+			// twice, so revoking one would silently leave the other working.
+			return nil, fmt.Errorf("auth: tokens %q and %q have the same digest", existing.Name, tok.Name)
+		}
+		set.byDigest[digest] = tok
+	}
+
+	if len(set.byDigest) == 0 {
+		return nil, errors.New("auth: no tokens configured")
+	}
+	return set, nil
+}
+
+func parseEntry(entry string) (Token, string, error) {
+	// SplitN with a limit of 4 so an RFC 3339 expiry keeps its own colons.
+	// Splitting on every colon would turn 2026-12-01T00:00:00Z into three more
+	// fields and reject every entry that carries a deadline.
+	parts := strings.SplitN(entry, ":", 4)
+	if len(parts) < 3 {
+		return Token{}, "", fmt.Errorf("auth: token entry %q must be name:scopes:sha256hex[:expiry]", redactEntry(entry))
+	}
+
+	name := strings.TrimSpace(parts[0])
+	if name == "" {
+		return Token{}, "", errors.New("auth: token entry has an empty name")
+	}
+
+	var scopes []Scope
 	for _, s := range strings.Split(parts[1], "+") {
 		scope := Scope(strings.TrimSpace(s))
 		if !validScope(scope) {
-			return "", nil, "", fmt.Errorf("auth: token %q has unknown scope %q (want %s)",
+			return Token{}, "", fmt.Errorf("auth: token %q has unknown scope %q (want %s)",
 				name, scope, scopeList())
 		}
 		scopes = append(scopes, scope)
 	}
 	if len(scopes) == 0 {
-		return "", nil, "", fmt.Errorf("auth: token %q has no scopes", name)
+		return Token{}, "", fmt.Errorf("auth: token %q has no scopes", name)
 	}
 
-	digest = strings.ToLower(strings.TrimSpace(parts[2]))
+	digest := strings.ToLower(strings.TrimSpace(parts[2]))
 	if len(digest) != sha256.Size*2 {
-		return "", nil, "", fmt.Errorf("auth: token %q needs a %d-character sha256 hex digest, got %d "+
+		return Token{}, "", fmt.Errorf("auth: token %q needs a %d-character sha256 hex digest, got %d "+
 			"(configure the digest, never the token itself)", name, sha256.Size*2, len(digest))
 	}
 	if _, err := hex.DecodeString(digest); err != nil {
-		return "", nil, "", fmt.Errorf("auth: token %q has a non-hex digest", name)
+		return Token{}, "", fmt.Errorf("auth: token %q has a non-hex digest", name)
 	}
-	return name, scopes, digest, nil
+
+	tok := Token{Name: name, Scopes: scopes}
+	if len(parts) == 4 {
+		raw := strings.TrimSpace(parts[3])
+		if raw != "" {
+			expiry, err := time.Parse(time.RFC3339, raw)
+			if err != nil {
+				// Refused rather than treated as "no expiry". A typo in a
+				// deadline would otherwise produce a credential that never
+				// expires, which is the opposite of what was written down.
+				return Token{}, "", fmt.Errorf("auth: token %q has an unparseable expiry %q, want RFC 3339 "+
+					"like 2026-12-01T00:00:00Z: %w", name, raw, err)
+			}
+			tok.NotAfter = expiry
+		}
+	}
+	return tok, digest, nil
 }
 
 // redactEntry keeps a malformed entry out of the logs in one piece. A
@@ -261,9 +425,13 @@ func (a *Authenticator) Authenticate(r *http.Request) (Token, error) {
 	// only thing the timing can reveal is hit or miss — which the response
 	// already says out loud. Adding subtle.ConstantTimeCompare after this
 	// lookup would compare a value against itself and prove nothing.
-	tok, found := a.byDigest[Digest(presented)]
+	tok, found := a.set.Load().byDigest[Digest(presented)]
 	if !found {
 		return Token{}, ErrBadCredential
+	}
+	if tok.Expired(a.now()) {
+		return Token{}, fmt.Errorf("%w: %s expired at %s",
+			ErrExpiredCredential, tok.Name, tok.NotAfter.UTC().Format(time.RFC3339))
 	}
 	return tok, nil
 }

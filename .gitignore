@@ -25,3 +25,4 @@ __pycache__/
 # not be committed.
 /deploy/prometheus-token
 /deploy/dev-tokens.env
+/deploy/tokens

@@ -140,7 +140,12 @@ func TestNewRejectsBadConfiguration(t *testing.T) {
 		{"nothing", nil, "no tokens configured"},
 		{"only blanks", []string{"", "  "}, "no tokens configured"},
 		{"too few fields", []string{"ci:admin"}, "must be name:scopes:sha256hex"},
-		{"too many fields", []string{"ci:admin:aa:bb"}, "must be name:scopes:sha256hex"},
+		// A fourth field is now the optional expiry, so this fails on the
+		// digest rather than on the field count.
+		{"short digest with an expiry", []string{"ci:admin:aa:2026-12-01T00:00:00Z"}, "sha256 hex digest"},
+		// Anything past the fourth colon is part of the expiry, which is what
+		// lets an RFC 3339 timestamp keep its own colons.
+		{"junk after the expiry", []string{entry("ci", "admin", "x") + ":a:b"}, "unparseable expiry"},
 		{"empty name", []string{":admin:" + Digest("x")}, "empty name"},
 		{"unknown scope", []string{"ci:superuser:" + Digest("x")}, "unknown scope"},
 		{"short digest", []string{"ci:admin:abc"}, "sha256 hex digest"},

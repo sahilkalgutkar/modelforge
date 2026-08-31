@@ -27,6 +27,8 @@ type Metrics struct {
 	driftPSI *prometheus.GaugeVec
 
 	authThrottled prometheus.Counter
+	authReloads   *prometheus.CounterVec
+	authTokens    prometheus.Gauge
 }
 
 // New registers the collectors with r.
@@ -78,6 +80,16 @@ func New(r prometheus.Registerer) *Metrics {
 			// how many distinct sources are failing.
 		}),
 
+		authReloads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "modelforge_auth_reloads_total",
+			Help: "Token-set reload attempts, by outcome (applied, unchanged, failed).",
+		}, []string{"outcome"}),
+
+		authTokens: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "modelforge_auth_tokens",
+			Help: "Tokens currently configured.",
+		}),
+
 		driftPSI: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "modelforge_feature_psi",
 			Help: "Population Stability Index per feature over the current window.",
@@ -85,7 +97,8 @@ func New(r prometheus.Registerer) *Metrics {
 	}
 
 	r.MustRegister(m.predictions, m.latency, m.errors, m.batchSize,
-		m.shadowComparisons, m.shadowDelta, m.driftPSI, m.authThrottled)
+		m.shadowComparisons, m.shadowDelta, m.driftPSI, m.authThrottled,
+		m.authReloads, m.authTokens)
 	return m
 }
 
@@ -129,6 +142,18 @@ func (m *Metrics) ObserveShadow(o routing.ShadowOutcome) {
 // a worse outcome than the failed logins it was meant to describe. The address
 // is in the log line, where a high-cardinality value belongs.
 func (m *Metrics) ObserveAuthThrottled() { m.authThrottled.Inc() }
+
+// ObserveAuthReload records the outcome of a token-set reload.
+//
+// A failed reload is a counter rather than a gauge because it is an event worth
+// alerting on even once: the running set is still serving, so nothing looks
+// broken, and the only sign that a rotation did not take is this number moving.
+func (m *Metrics) ObserveAuthReload(outcome string, tokens int) {
+	m.authReloads.WithLabelValues(outcome).Inc()
+	if tokens > 0 {
+		m.authTokens.Set(float64(tokens))
+	}
+}
 
 // ObserveDrift publishes a drift report as gauges.
 func (m *Metrics) ObserveDrift(rep drift.Report) {
