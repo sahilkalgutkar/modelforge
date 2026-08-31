@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -25,6 +26,15 @@ const (
 
 // CSRFHeader is where a client echoes the CSRF cookie's value.
 const CSRFHeader = "X-CSRF-Token"
+
+// CSRFField is the form field an HTML form echoes it in instead.
+//
+// A form cannot set a header, so a server-rendered page with no JavaScript has
+// no way to use CSRFHeader. The field is the standard alternative and is
+// equally safe: what makes double-submit work is that a cross-site attacker
+// cannot *read* the cookie, and that is true whether the value comes back in a
+// header or a body.
+const CSRFField = "csrf_token"
 
 // Errors callers are expected to handle.
 var (
@@ -348,12 +358,31 @@ func CheckCSRF(r *http.Request, sess *Session) error {
 
 	presented := r.Header.Get(CSRFHeader)
 	if presented == "" {
-		return fmt.Errorf("%w: no %s header", ErrCSRFFailed, CSRFHeader)
+		// Only form-encoded bodies are parsed. Calling ParseForm on a JSON
+		// request would consume the body the handler is about to decode, so a
+		// convenience for HTML forms would silently break every API POST.
+		if isFormEncoded(r) {
+			if err := r.ParseForm(); err == nil {
+				presented = r.PostForm.Get(CSRFField)
+			}
+		}
+	}
+	if presented == "" {
+		return fmt.Errorf("%w: no %s header or %s field", ErrCSRFFailed, CSRFHeader, CSRFField)
 	}
 	if subtle.ConstantTimeCompare([]byte(presented), []byte(sess.CSRF)) != 1 {
 		return fmt.Errorf("%w: the %s header does not match this session", ErrCSRFFailed, CSRFHeader)
 	}
 	return nil
+}
+
+// isFormEncoded reports whether the body is an HTML form submission.
+func isFormEncoded(r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.TrimSpace(strings.ToLower(ct)) == "application/x-www-form-urlencoded"
 }
 
 func isSafeMethod(method string) bool {

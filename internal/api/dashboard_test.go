@@ -270,24 +270,60 @@ func TestDashboardShowsDriftState(t *testing.T) {
 	}
 }
 
-// TestDashboardIsReadOnly: no form or method that could change what serves
-// traffic.
-func TestDashboardIsReadOnly(t *testing.T) {
+// TestIndexIsAListNotAControlSurface. The overview shows every model, so a
+// stray action there would be a click away from changing the wrong one; the
+// forms live on a page that is already about one model.
+func TestIndexIsAListNotAControlSurface(t *testing.T) {
 	h := newHarness(t)
-	h.do("POST", "/v1/models", createModelRequest{Name: "readonly"}) //nolint:errcheck
-	h.upload("readonly", "binary_logistic.model.json", featureNames(6))
+	h.do("POST", "/v1/models", createModelRequest{Name: "listed-only"}) //nolint:errcheck
+	h.upload("listed-only", "binary_logistic.model.json", featureNames(6))
 
-	for _, path := range []string{"/", "/models/readonly"} {
-		_, body := h.getPage(t, path, "")
-		if strings.Contains(strings.ToLower(body), "<form") {
-			t.Errorf("%s contains a form; the dashboard is meant to be read-only", path)
+	_, body := h.getPage(t, "/", "")
+	if strings.Contains(strings.ToLower(body), "<form") {
+		t.Errorf("the index contains a form:\n%s", truncate(body))
+	}
+}
+
+// TestEveryActionFormCarriesACSRFToken. A form rendered without one would be
+// refused on submit, which reads as a broken page rather than as the defence
+// working.
+func TestEveryActionFormCarriesACSRFToken(t *testing.T) {
+	h := newHarness(t)
+	h.do("POST", "/v1/models", createModelRequest{Name: "formful"}) //nolint:errcheck
+	h.upload("formful", "binary_logistic.model.json", featureNames(6))
+
+	_, body := h.getPage(t, "/models/formful", "")
+	forms := strings.Count(strings.ToLower(body), "<form")
+	if forms == 0 {
+		t.Fatalf("no action forms rendered:\n%s", truncate(body))
+	}
+	tokens := strings.Count(body, `name="csrf_token"`)
+	if tokens != forms {
+		t.Errorf("%d forms but %d CSRF fields", forms, tokens)
+	}
+	// And every one posts, so none can be triggered by a link or a prefetch.
+	if strings.Count(strings.ToLower(body), `method="post"`) != forms {
+		t.Errorf("not every form uses POST:\n%s", truncate(body))
+	}
+}
+
+// TestGetRoutesDoNotMutate: the action endpoints exist only under POST, so no
+// amount of link-following changes what serves traffic.
+func TestGetRoutesDoNotMutate(t *testing.T) {
+	h := newHarness(t)
+	h.deployable(t, "immutable-by-get")
+
+	for _, path := range []string{
+		"/models/immutable-by-get/plan?action=deploy&version=2",
+		"/models/immutable-by-get/apply?action=deploy&version=2",
+	} {
+		resp, _ := h.getPage(t, path, "")
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusSeeOther {
+			t.Errorf("GET %s was accepted with %d", path, resp.StatusCode)
 		}
 	}
-
-	// And the routes themselves reject writes.
-	resp, _ := h.do("POST", "/", nil)
-	if resp.StatusCode == http.StatusOK {
-		t.Error("POST / was accepted")
+	if p, _ := h.router.Policy("immutable-by-get"); policyLabel(p) != "v1=100%" {
+		t.Errorf("a GET changed the policy to %q", policyLabel(p))
 	}
 }
 

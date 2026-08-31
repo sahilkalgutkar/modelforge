@@ -1,0 +1,27 @@
+{{define "content"}}
+{{with .Confirm}}
+<h2>Confirm this change to {{.Model}}</h2>
+<p>{{.Summary}}</p>
+
+<table>
+  <thead><tr><th>Now</th><th>After</th></tr></thead>
+  <tbody><tr>
+    <td>{{.Before}}</td>
+    <td><strong>{{.After}}</strong></td>
+  </tr></tbody>
+</table>
+
+<p class="warn">This changes which model answers live requests, immediately.</p>
+
+<form method="post" action="/models/{{.Model}}/apply">
+  <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+  <input type="hidden" name="action" value="{{.Action}}">
+  <input type="hidden" name="version" value="{{.Version}}">
+  <input type="hidden" name="percent" value="{{.Percent}}">
+  <input type="hidden" name="stable" value="{{.Stable}}">
+  <input type="hidden" name="expected" value="{{.Expected}}">
+  <button type="submit">Apply</button>
+  <a href="/models/{{.Model}}">Cancel</a>
+</form>
+{{end}}
+{{end}}

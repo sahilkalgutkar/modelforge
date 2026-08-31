@@ -41,7 +41,8 @@
   <span class="who">{{.Identity}} · {{.Scopes}} · <a href="/logout">sign out</a></span>
 </header>
 {{template "content" .}}
-<footer>Read-only. Deployments are changed with <code>modelforgectl</code>, where they are
-scripted and audited.{{if .Refresh}} Refreshes every {{.Refresh}}s.{{end}}</footer>
+<footer>Deployment changes are audited and also available through
+<code>modelforgectl</code>, where they can be scripted.{{if .Refresh}}
+Refreshes every {{.Refresh}}s.{{end}}</footer>
 </div></body>
 </html>{{end}}

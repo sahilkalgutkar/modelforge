@@ -7,6 +7,8 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -412,5 +414,152 @@ func TestAuthConfigAdvertisesBrowserLogin(t *testing.T) {
 
 	if !strings.Contains(string(body), `"browser_login":true`) {
 		t.Errorf("auth config does not advertise browser login: %s", body)
+	}
+}
+
+// TestDeployActionThroughABrowserSession is the flow as an operator performs
+// it: sign in, review the change, apply it — with the CSRF token coming from a
+// form field, because a page with no JavaScript cannot set a header.
+func TestDeployActionThroughABrowserSession(t *testing.T) {
+	p := newFakeIDP(t)
+	srv, client := browserServer(t, p)
+
+	resp, err := client.Get(srv.URL + "/login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	csrf := cookieNamed(client.Jar, srv.URL, auth.CSRFCookie)
+	if csrf == nil {
+		t.Fatal("no CSRF cookie")
+	}
+
+	// Register a model with two versions and deploy the first, over the API,
+	// using the same session.
+	post := func(path string, body string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest("POST", srv.URL+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(auth.CSRFHeader, csrf.Value)
+		r, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	post("/v1/models", `{"name":"ui-deploy"}`).Body.Close()
+
+	for range 2 {
+		f, err := os.Open(filepath.Join("..", "..", "testdata", "xgboost", "binary_logistic.model.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := "?feature=f0&feature=f1&feature=f2&feature=f3&feature=f4&feature=f5"
+		req, _ := http.NewRequest("POST", srv.URL+"/v1/models/ui-deploy/versions"+q, f)
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set(auth.CSRFHeader, csrf.Value)
+		r, err := client.Do(req)
+		f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+	}
+
+	req, _ := http.NewRequest("PUT", srv.URL+"/v1/models/ui-deploy/policy",
+		strings.NewReader(`{"routes":[{"version":1,"weight":100}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(auth.CSRFHeader, csrf.Value)
+	r, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+
+	// The model page offers the actions, with a CSRF token embedded.
+	pageResp, err := client.Get(srv.URL + "/models/ui-deploy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageBody, _ := io.ReadAll(pageResp.Body)
+	pageResp.Body.Close()
+	if !strings.Contains(string(pageBody), "Change what serves traffic") {
+		t.Fatalf("no actions on the model page:\n%s", string(pageBody)[:min(800, len(pageBody))])
+	}
+	if !strings.Contains(string(pageBody), csrf.Value) {
+		t.Error("the forms do not carry a CSRF token, so submitting one would be refused")
+	}
+
+	// Plan, using a form field for the token exactly as the rendered form does.
+	form := url.Values{"action": {"deploy"}, "version": {"2"}, auth.CSRFField: {csrf.Value}}
+	planResp, err := client.PostForm(srv.URL+"/models/ui-deploy/plan", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planBody, _ := io.ReadAll(planResp.Body)
+	planResp.Body.Close()
+	if planResp.StatusCode != http.StatusOK {
+		t.Fatalf("plan = %d: %s", planResp.StatusCode, planBody)
+	}
+	if !strings.Contains(string(planBody), "Confirm this change") {
+		t.Errorf("no confirmation page:\n%s", planBody)
+	}
+
+	// Apply.
+	form.Set("expected", "v1=100%")
+	applyResp, err := client.PostForm(srv.URL+"/models/ui-deploy/apply", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyResp.Body.Close()
+	if applyResp.StatusCode != http.StatusOK {
+		t.Fatalf("apply landed on %d", applyResp.StatusCode)
+	}
+
+	final, err := client.Get(srv.URL + "/v1/models/ui-deploy/policy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer final.Body.Close()
+	body, _ := io.ReadAll(final.Body)
+	if !strings.Contains(string(body), `"version":2`) {
+		t.Errorf("the deploy did not take: %s", body)
+	}
+}
+
+// TestDeployActionWithoutCSRFIsRefused: the forms are the reason the CSRF check
+// accepts a field, and that must not become a way around it.
+func TestDeployActionWithoutCSRFIsRefused(t *testing.T) {
+	p := newFakeIDP(t)
+	srv, client := browserServer(t, p)
+
+	resp, err := client.Get(srv.URL + "/login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// A cross-site page can make the browser post, but cannot read the cookie
+	// to fill in the field.
+	bad, err := client.PostForm(srv.URL+"/models/anything/plan",
+		url.Values{"action": {"deploy"}, "version": {"1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad.Body.Close()
+	if bad.StatusCode != http.StatusForbidden {
+		t.Fatalf("a form post with no CSRF token = %d, want 403", bad.StatusCode)
+	}
+
+	// And a wrong token is no better.
+	wrong, err := client.PostForm(srv.URL+"/models/anything/plan",
+		url.Values{"action": {"deploy"}, "version": {"1"}, auth.CSRFField: {"not-the-token"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong.Body.Close()
+	if wrong.StatusCode != http.StatusForbidden {
+		t.Fatalf("a form post with the wrong CSRF token = %d, want 403", wrong.StatusCode)
 	}
 }

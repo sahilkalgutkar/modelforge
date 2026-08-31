@@ -32,6 +32,57 @@
   </tbody>
 </table>
 
+{{if .CanDeploy}}
+<h2>Change what serves traffic</h2>
+<p class="who">Every action shows exactly what will change before it takes effect.</p>
+<table>
+  <thead><tr><th>Action</th><th>Details</th><th></th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Deploy</td>
+      <td><form method="post" action="/models/{{.Model.Name}}/plan" id="deploy">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <input type="hidden" name="action" value="deploy">
+        version <select name="version">{{range .Versions}}<option value="{{.Version}}">v{{.Version}}</option>{{end}}</select>
+        — all traffic</td>
+      <td><button type="submit">Review</button></form></td>
+    </tr>
+    <tr>
+      <td>Canary</td>
+      <td><form method="post" action="/models/{{.Model.Name}}/plan" id="canary">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <input type="hidden" name="action" value="canary">
+        send <input type="number" name="percent" value="10" min="1" max="99" style="width:4rem">%
+        to <select name="version">{{range .Versions}}<option value="{{.Version}}">v{{.Version}}</option>{{end}}</select>
+        keeping the rest on <select name="stable">{{range .Versions}}<option value="{{.Version}}">v{{.Version}}</option>{{end}}</select></td>
+      <td><button type="submit">Review</button></form></td>
+    </tr>
+    <tr>
+      <td>Shadow</td>
+      <td><form method="post" action="/models/{{.Model.Name}}/plan" id="shadow">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <input type="hidden" name="action" value="shadow">
+        mirror traffic to <select name="version">{{range .Versions}}<option value="{{.Version}}">v{{.Version}}</option>{{end}}</select>
+        without serving from it</td>
+      <td><button type="submit">Review</button></form></td>
+    </tr>
+    {{if .HasShadow}}
+    <tr>
+      <td>Stop shadowing</td>
+      <td><form method="post" action="/models/{{.Model.Name}}/plan" id="unshadow">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <input type="hidden" name="action" value="unshadow">
+        stop mirroring traffic</td>
+      <td><button type="submit">Review</button></form></td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="who">Your credential can read this model but not change what it serves.
+Changing a deployment needs the admin scope.</p>
+{{end}}
+
 {{range .Drift}}
 <h2>Drift · v{{.Version}} <span class="who">over {{.Window}}, {{.Samples}} samples</span></h2>
 {{if not .Ready}}
