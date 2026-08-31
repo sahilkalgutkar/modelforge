@@ -808,7 +808,7 @@ and a fake agrees with whatever the code happens to do.
 same database and truncate it between cases, so running packages concurrently
 has them resetting the database underneath each other.
 
-Coverage is **89.1%** of `internal/`, measured with `-coverpkg` so that code is
+Coverage is **89.9%** of `internal/`, measured with `-coverpkg` so that code is
 attributed to the package that owns it rather than the package running the test
 — without it the end-to-end suites, which exercise serving and routing through
 HTTP, would report those packages as untested.
