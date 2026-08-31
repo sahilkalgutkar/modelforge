@@ -99,6 +99,16 @@ func NewServer(deps Deps) *Server {
 		s.mux.Handle(pattern, mw.RequireFunc(auth.ScopeAdmin, h))
 	}
 
+	// Who am I. Requires only that the caller authenticated at all, so any
+	// valid credential can ask; the answer is about the caller and reveals
+	// nothing they do not already hold.
+	s.mux.Handle("GET /v1/auth/whoami", mw.RequireFunc(auth.ScopePredict, s.handleWhoAmI))
+
+	// Login metadata, deliberately unauthenticated: a client cannot present a
+	// credential before it knows where to obtain one, and every value here is
+	// visible to anybody who watches a browser perform a login.
+	s.mux.HandleFunc("GET /v1/auth/config", s.handleAuthConfig)
+
 	// Operations. Deliberately unauthenticated.
 	//
 	// A liveness probe that needs a credential is a probe that starts failing
@@ -556,6 +566,64 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "loaded": len(loaded)})
+}
+
+// WhoAmIResponse describes the caller.
+type WhoAmIResponse struct {
+	Name    string       `json:"name"`
+	Kind    string       `json:"kind"`
+	Scopes  []auth.Scope `json:"scopes"`
+	Subject string       `json:"subject,omitempty"`
+	Issuer  string       `json:"issuer,omitempty"`
+	Email   string       `json:"email,omitempty"`
+	Expires string       `json:"expires,omitempty"`
+}
+
+// handleWhoAmI reports the identity behind the current credential.
+//
+// It exists because "am I logged in, as whom, and with what access" is the
+// first question anybody asks when a request is refused, and answering it by
+// decoding a JWT locally would report what the token claims rather than what
+// this server accepts — which is precisely the thing in doubt.
+func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
+	tok, ok := auth.FromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("no identity on the request"))
+		return
+	}
+
+	kind := "service"
+	if tok.Human() {
+		kind = "user"
+	}
+	resp := WhoAmIResponse{
+		Name: tok.Name, Kind: kind, Scopes: tok.Scopes,
+		Subject: tok.Subject, Issuer: tok.Issuer, Email: tok.Email,
+	}
+	if !tok.NotAfter.IsZero() {
+		resp.Expires = tok.NotAfter.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleAuthConfig advertises where to log in.
+func (s *Server) handleAuthConfig(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Auth.IsDisabled() {
+		writeJSON(w, http.StatusOK, map[string]any{"login": false, "reason": "authentication is disabled"})
+		return
+	}
+	v := s.deps.Auth.OIDC()
+	if v == nil || !v.LoginEnabled() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"login":  false,
+			"reason": "this server has no identity provider configured for interactive login",
+		})
+		return
+	}
+	cfg := v.PublicConfig()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"login": true, "issuer": cfg.Issuer, "client_id": cfg.ClientID, "audience": cfg.Audience,
+	})
 }
 
 // --- helpers ---

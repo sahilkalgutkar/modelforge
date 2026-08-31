@@ -35,6 +35,16 @@ type OIDCConfig struct {
 	// and they never intended to authenticate here.
 	Audience string
 
+	// ClientID is the public OAuth client the CLI authenticates as. It is
+	// advertised to clients so they do not have to be configured separately
+	// from the server they are talking to.
+	//
+	// There is no client secret. The login flow is a native application on a
+	// user's machine, and a secret shipped inside one is not a secret — it is
+	// a string every user can read out of the binary. PKCE replaces it, which
+	// is what RFC 8252 says to do for exactly this case.
+	ClientID string
+
 	// GroupsClaim names the claim carrying a user's group or role
 	// memberships. Providers disagree: Okta and Auth0 commonly use "groups",
 	// Keycloak "roles", Entra ID "roles" or a mapped claim.
@@ -73,6 +83,29 @@ type OIDCVerifier struct {
 	readyOnce sync.Once
 	ready     chan struct{}
 }
+
+// PublicConfig is the metadata a client needs to start a login. It is
+// deliberately public: every value in it is visible to anybody who watches a
+// browser perform a login, and withholding it would only stop legitimate
+// clients from configuring themselves.
+type PublicConfig struct {
+	Issuer   string `json:"issuer"`
+	ClientID string `json:"client_id"`
+	Audience string `json:"audience"`
+}
+
+// PublicConfig returns the metadata a client needs to log in.
+func (v *OIDCVerifier) PublicConfig() PublicConfig {
+	return PublicConfig{
+		Issuer:   v.cfg.Issuer,
+		ClientID: v.cfg.ClientID,
+		Audience: v.cfg.Audience,
+	}
+}
+
+// LoginEnabled reports whether a client can start an interactive login, which
+// needs a client id as well as an issuer.
+func (v *OIDCVerifier) LoginEnabled() bool { return v.cfg.ClientID != "" }
 
 // Validate checks an OIDC configuration.
 func (c OIDCConfig) Validate() error {

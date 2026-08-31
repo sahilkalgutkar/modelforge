@@ -39,6 +39,8 @@ func main() {
 		"identity provider URL, enabling per-user login alongside static tokens")
 	flag.StringVar(&cfg.OIDCAudience, "oidc-audience", os.Getenv("MODELFORGE_OIDC_AUDIENCE"),
 		"value a token's aud claim must contain; required with -oidc-issuer")
+	flag.StringVar(&cfg.OIDCClientID, "oidc-client-id", os.Getenv("MODELFORGE_OIDC_CLIENT_ID"),
+		"public OAuth client id the CLI logs in as; enables `modelforgectl login`")
 	flag.StringVar(&cfg.OIDCGroupsClaim, "oidc-groups-claim", envOr("MODELFORGE_OIDC_GROUPS_CLAIM", "groups"),
 		"claim carrying group membership")
 	scopeMap := flag.String("oidc-scope-map", os.Getenv("MODELFORGE_OIDC_SCOPE_MAP"),

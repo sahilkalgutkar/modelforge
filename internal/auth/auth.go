@@ -194,6 +194,9 @@ func Disabled() *Authenticator {
 	return a
 }
 
+// OIDC returns the identity provider verifier, or nil if none is configured.
+func (a *Authenticator) OIDC() *OIDCVerifier { return a.oidc }
+
 // IsDisabled reports whether authentication is off.
 func (a *Authenticator) IsDisabled() bool { return a.disabled }
 
