@@ -1,0 +1,56 @@
+{{define "content"}}
+<h2>{{.Model.Name}}</h2>
+{{if .Model.Description}}<p>{{.Model.Description}}</p>{{end}}
+<p>{{if .Model.Policy}}Serving <strong>{{.Model.Policy}}</strong>{{else}}
+   <span class="empty">Not deployed. <code>modelforgectl deploy {{.Model.Name}} &lt;version&gt;</code></span>{{end}}</p>
+
+<h2>Versions</h2>
+<table>
+  <thead><tr>
+    <th>Version</th><th>Traffic</th><th>Digest</th><th class="num">Features</th>
+    <th class="num">Requests</th><th class="num">Failures</th>
+    <th class="num">Mean batch</th><th>State</th>
+  </tr></thead>
+  <tbody>
+  {{range .Versions}}
+    <tr>
+      <td>v{{.Version}}</td>
+      <td>{{if .Weight}}<span class="bar" style="width:{{.BarWidth}}px"></span> {{.Weight}}%
+          {{else}}<span class="empty">—</span>{{end}}</td>
+      <td><code>{{.Digest}}</code></td>
+      <td class="num">{{.FeatureCount}}</td>
+      <td class="num">{{.Requests}}</td>
+      <td class="num {{if .Failures}}bad{{end}}">{{.Failures}}</td>
+      <td class="num">{{if .Loaded}}{{.MeanBatch}}{{else}}—{{end}}</td>
+      <td>
+        {{if .Shadow}}<span class="tag">shadow</span>{{end}}
+        {{if .RemovedByGuard}}<span class="tag bad">pulled by guard</span>{{end}}
+        {{if not .Loaded}}<span class="tag">not loaded</span>{{end}}
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+
+{{range .Drift}}
+<h2>Drift · v{{.Version}} <span class="who">over {{.Window}}, {{.Samples}} samples</span></h2>
+{{if not .Ready}}
+  <p class="empty">Not enough traffic yet ({{.Samples}} of {{.MinSamples}} samples).
+  This is different from "no drift".</p>
+{{else}}
+<table>
+  <thead><tr><th>Feature</th><th class="num">PSI</th><th>Severity</th><th class="num">Missing</th></tr></thead>
+  <tbody>
+  {{range .Features}}
+    <tr>
+      <td>{{.Feature}}</td>
+      <td class="num">{{.PSI}}</td>
+      <td><span class="{{.Class}}">{{.Severity}}</span></td>
+      <td class="num">{{.Missing}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+{{end}}
+{{end}}

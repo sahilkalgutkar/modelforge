@@ -133,6 +133,10 @@ func NewServer(deps Deps) *Server {
 	// visible to anybody who watches a browser perform a login.
 	s.mux.HandleFunc("GET /v1/auth/config", s.handleAuthConfig)
 
+	// The dashboard. Read-only, and behind the read scope like any other read.
+	s.mux.Handle("GET /{$}", s.dashboardEntry(s.handleDashboard))
+	s.mux.Handle("GET /models/{model}", s.dashboardEntry(s.handleModelPage))
+
 	// Operations. Deliberately unauthenticated.
 	//
 	// A liveness probe that needs a credential is a probe that starts failing
