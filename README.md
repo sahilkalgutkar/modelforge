@@ -136,6 +136,22 @@ CLI. Source it before using the client:
 source deploy/dev-tokens.env
 ```
 
+If port 5432 is already spoken for, or you would rather not run Postgres in
+Docker at all, skip `make db` and point everything at your own instance. The
+server reads `MODELFORGE_DATABASE_URL` and the tests read
+`MODELFORGE_TEST_DATABASE_URL`; both need to be separate databases, because the
+suite truncates its own between cases.
+
+```bash
+export MODELFORGE_DATABASE_URL="postgres://you@localhost:5433/modelforge?sslmode=disable"
+export MODELFORGE_TEST_DATABASE_URL="postgres://you@localhost:5433/modelforge_test?sslmode=disable"
+make run    # and make test
+```
+
+The server creates its own schema on startup, so an empty database is all it
+needs. Every flag has a matching `MODELFORGE_`-prefixed environment variable —
+`./bin/modelforge -h` lists them.
+
 Train something and deploy it:
 
 ```bash

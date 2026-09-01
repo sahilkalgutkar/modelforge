@@ -1,7 +1,10 @@
 # Local development. CI runs the same commands; see .github/workflows/ci.yml.
 
-DB ?= postgres://modelforge:modelforge@localhost:5432/modelforge?sslmode=disable
-TEST_DB ?= postgres://modelforge:modelforge@localhost:5432/modelforge_test?sslmode=disable
+# Both default to the compose Postgres, and both defer to the environment
+# variables the server and the tests read directly, so pointing everything at
+# your own instance is one export rather than an argument on every target.
+DB ?= $(or $(MODELFORGE_DATABASE_URL),postgres://modelforge:modelforge@localhost:5432/modelforge?sslmode=disable)
+TEST_DB ?= $(or $(MODELFORGE_TEST_DATABASE_URL),postgres://modelforge:modelforge@localhost:5432/modelforge_test?sslmode=disable)
 
 .PHONY: build test cover lint fixtures db up run tokens rotate clean
 
@@ -11,7 +14,8 @@ build:
 
 # -p 1 because several suites reset the same test database; see ci.yml.
 test:
-	go test -p 1 -race -coverpkg=./internal/... -coverprofile=coverage.out ./...
+	MODELFORGE_TEST_DATABASE_URL="$(TEST_DB)" \
+	  go test -p 1 -race -coverpkg=./internal/... -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out | tail -1
 
 cover: test
