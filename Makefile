@@ -1,10 +1,20 @@
 # Local development. CI runs the same commands; see .github/workflows/ci.yml.
 
+# Host ports the compose stack publishes. Exported so `docker compose` picks
+# them up, and so the connection strings below follow Postgres when it moves --
+# an override that left DB pointing at 5432 would be a knob that breaks things
+# instead of fixing them. 3000 in particular is taken on any machine running a
+# Node dev server.
+POSTGRES_HOST_PORT ?= 5432
+PROMETHEUS_HOST_PORT ?= 9090
+GRAFANA_HOST_PORT ?= 3000
+export POSTGRES_HOST_PORT PROMETHEUS_HOST_PORT GRAFANA_HOST_PORT
+
 # Both default to the compose Postgres, and both defer to the environment
 # variables the server and the tests read directly, so pointing everything at
 # your own instance is one export rather than an argument on every target.
-DB ?= $(or $(MODELFORGE_DATABASE_URL),postgres://modelforge:modelforge@localhost:5432/modelforge?sslmode=disable)
-TEST_DB ?= $(or $(MODELFORGE_TEST_DATABASE_URL),postgres://modelforge:modelforge@localhost:5432/modelforge_test?sslmode=disable)
+DB ?= $(or $(MODELFORGE_DATABASE_URL),postgres://modelforge:modelforge@localhost:$(POSTGRES_HOST_PORT)/modelforge?sslmode=disable)
+TEST_DB ?= $(or $(MODELFORGE_TEST_DATABASE_URL),postgres://modelforge:modelforge@localhost:$(POSTGRES_HOST_PORT)/modelforge_test?sslmode=disable)
 
 .PHONY: build test cover lint fixtures db up run tokens rotate clean
 
@@ -43,7 +53,7 @@ db:
 
 up: db tokens
 	docker compose -f deploy/docker-compose.yml up -d
-	@echo "prometheus http://localhost:9090   grafana http://localhost:3000 (admin/admin)"
+	@echo "prometheus http://localhost:$(PROMETHEUS_HOST_PORT)   grafana http://localhost:$(GRAFANA_HOST_PORT) (admin/admin)"
 
 # Mint the development tokens: one admin for the CLI, one read for Prometheus.
 # Uses the --env form so this does not depend on the wording of the human

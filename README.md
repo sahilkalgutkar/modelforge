@@ -128,6 +128,24 @@ make db        # Postgres on :5432, plus the test database
 make run       # mints development tokens, then serves on :8080
 ```
 
+Every host port the compose stack publishes is overridable, which matters
+because 5432 and 3000 are usually already taken by something else. The
+variables are exported by the Makefile, so setting one moves the published port
+*and* the connection strings that point at it:
+
+```bash
+POSTGRES_HOST_PORT=5433 GRAFANA_HOST_PORT=3001 make db run
+```
+
+| Service | Default | Override |
+|---|---|---|
+| Postgres | localhost:5432 | `POSTGRES_HOST_PORT` |
+| Prometheus | http://localhost:9090 | `PROMETHEUS_HOST_PORT` |
+| Grafana | http://localhost:3000 | `GRAFANA_HOST_PORT` |
+
+Only the host side moves; inside the compose network the services still reach
+each other on the standard ports.
+
 `make run` writes `deploy/tokens` on first use — the server's reloadable token
 file — plus `deploy/dev-tokens.env` holding the matching admin token for the
 CLI. Source it before using the client:
@@ -861,6 +879,8 @@ proxy overwrites it.
 ```bash
 make up   # adds Prometheus on :9090 and Grafana on :3000
 ```
+
+(Both ports are overridable — see the table in the quickstart.)
 
 Grafana comes provisioned with a dashboard and Prometheus with four alert rules.
 Latency histogram buckets start at 250µs rather than Prometheus' default 5ms,
