@@ -143,6 +143,10 @@ POSTGRES_HOST_PORT=5433 GRAFANA_HOST_PORT=3001 make db run
 | Prometheus | http://localhost:9090 | `PROMETHEUS_HOST_PORT` |
 | Grafana | http://localhost:3000 | `GRAFANA_HOST_PORT` |
 
+Or copy `.env.example` to `.env` and edit it, which the Makefile reads. A
+variable set in the environment still beats the file, so the inline form above
+overrides a `.env` rather than fighting it.
+
 Only the host side moves; inside the compose network the services still reach
 each other on the standard ports.
 

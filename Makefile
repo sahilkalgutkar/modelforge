@@ -1,13 +1,22 @@
 # Local development. CI runs the same commands; see .github/workflows/ci.yml.
 
+# Optional local overrides, copied from .env.example. The compose file lives in
+# deploy/, so compose would look for deploy/.env and never see one at the root
+# -- and the exports below would win over it anyway. Reading it here is what
+# makes the file actually take effect.
+-include .env
+
 # Host ports the compose stack publishes. Exported so `docker compose` picks
 # them up, and so the connection strings below follow Postgres when it moves --
 # an override that left DB pointing at 5432 would be a knob that breaks things
 # instead of fixing them. 3000 in particular is taken on any machine running a
 # Node dev server.
-POSTGRES_HOST_PORT ?= 5432
-PROMETHEUS_HOST_PORT ?= 9090
-GRAFANA_HOST_PORT ?= 3000
+#
+# Precedence is environment, then .env, then the default, so an inline
+# `POSTGRES_HOST_PORT=5433 make db` still beats a value sitting in .env.
+POSTGRES_HOST_PORT := $(or $(shell printenv POSTGRES_HOST_PORT),$(POSTGRES_HOST_PORT),5432)
+PROMETHEUS_HOST_PORT := $(or $(shell printenv PROMETHEUS_HOST_PORT),$(PROMETHEUS_HOST_PORT),9090)
+GRAFANA_HOST_PORT := $(or $(shell printenv GRAFANA_HOST_PORT),$(GRAFANA_HOST_PORT),3000)
 export POSTGRES_HOST_PORT PROMETHEUS_HOST_PORT GRAFANA_HOST_PORT
 
 # Both default to the compose Postgres, and both defer to the environment

@@ -26,3 +26,7 @@ __pycache__/
 /deploy/prometheus-token
 /deploy/dev-tokens.env
 /deploy/tokens
+
+# Local port overrides, copied from .env.example. The example is tracked; the
+# copy is per-machine.
+/.env
