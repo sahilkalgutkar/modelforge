@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -349,19 +350,45 @@ func truncate(s string) string {
 	return s
 }
 
+// issuedPorts records every address freePort has handed out in this test
+// binary, so two callers cannot be pointed at the same one.
+var (
+	issuedMu    sync.Mutex
+	issuedPorts = map[string]bool{}
+)
+
 // freePort asks the kernel for an unused port and gives it straight back.
 // There is a race between releasing it and Run binding it, but it is the only
 // way to test the real listener path — Run owns its own listener, so the port
 // cannot be handed in already bound.
+//
+// The kernel will not offer a port that is still open, but it does reuse one
+// released a moment ago, so repeated calls could name the same port twice and
+// the second bind would fail with "address already in use". Anything already
+// issued is therefore skipped.
 func freePort(t *testing.T) string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for attempt := 0; attempt < 50; attempt++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := l.Addr().String()
+		l.Close()
+
+		issuedMu.Lock()
+		fresh := !issuedPorts[addr]
+		if fresh {
+			issuedPorts[addr] = true
+		}
+		issuedMu.Unlock()
+
+		if fresh {
+			return addr
+		}
 	}
-	addr := l.Addr().String()
-	l.Close()
-	return addr
+	t.Fatal("could not find an unused loopback port")
+	return ""
 }
 
 // TestRunServesThenShutsDownCleanly exercises the real listener and the
